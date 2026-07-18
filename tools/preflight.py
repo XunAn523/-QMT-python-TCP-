@@ -191,6 +191,20 @@ def validate_deployment(config: Dict[str, Any], config_path: Path) -> None:
             "deployment requires Windows CPython 3.12 x64; current=%s %s %s-bit"
             % (platform.system(), platform.python_version(), struct.calcsize("P") * 8)
         )
+    expected_prefix = os.path.normcase(os.path.realpath(str(ROOT / ".venv")))
+    expected_executable = os.path.normcase(
+        os.path.realpath(str(ROOT / ".venv" / "Scripts" / "python.exe"))
+    )
+    actual_prefix = os.path.normcase(os.path.realpath(sys.prefix))
+    actual_executable = os.path.normcase(os.path.realpath(sys.executable))
+    if (
+        sys.prefix == sys.base_prefix
+        or actual_prefix != expected_prefix
+        or actual_executable != expected_executable
+    ):
+        raise PreflightError(
+            "deployment must run with this project's .venv\\Scripts\\python.exe"
+        )
     account = config["accounts"][0]
     runtime_dir = validate_local_path(account["runtime_dir"], "runtime_dir")
     validate_storage(runtime_dir)

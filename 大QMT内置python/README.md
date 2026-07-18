@@ -19,7 +19,7 @@ helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latenc
 
 ## 唯一配置入口
 
-只编辑项目根目录 `../.env`，本目录没有第二份 `.env.example` 或账户 JSON。生成器调用根目录 `../tools/project_env.py` 的 `load_deployment()`，并严格消费其单账户 `qmt_config`。
+只编辑项目根目录 `../.env`，本目录没有第二份 `.env.example` 或账户 JSON。`QMT_LOCAL_PYTHON_EXE` 固定为 `.venv\Scripts\python.exe`，由根目录 `setup_venv.ps1` 创建；禁止改成系统 Python 绝对路径。生成器调用根目录 `../tools/project_env.py` 的 `load_deployment()`，并严格消费其单账户 `qmt_config`。
 
 与本端相关的根配置为：
 
@@ -46,7 +46,7 @@ helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latenc
 
 ## 生成、校验和加载
 
-先把根 `.env.example` 复制为 `.env`，填入真实账号，再将 `QMT_LOCAL_ACCOUNT_ENABLED=true`。推荐在项目根执行受控生成、检查与安装：
+首次部署先在项目根执行 `.\setup_venv.ps1`。然后把根 `.env.example` 复制为 `.env`，填入真实账号，再将 `QMT_LOCAL_ACCOUNT_ENABLED=true`。推荐在项目根执行受控生成、检查与安装：
 
 ```powershell
 .\generate_helper.ps1 -Deploy -ConfirmStoppedStrategy
@@ -55,8 +55,8 @@ helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latenc
 该脚本要求策略已停止，并使用 staging/backup/rename 完成可回滚目录切换。仅在开发生成器时，才在本目录直接执行：
 
 ```powershell
-C:\Python312\python.exe .\tools\generate_helpers.py --env-file ..\.env
-C:\Python312\python.exe .\tools\generate_helpers.py --env-file ..\.env --check
+& '..\.venv\Scripts\python.exe' .\tools\generate_helpers.py --env-file ..\.env
+& '..\.venv\Scripts\python.exe' .\tools\generate_helpers.py --env-file ..\.env --check
 ```
 
 默认 staging 输出由 `QMT_LOCAL_HELPER_OUTPUT_DIR` 决定。生成器为唯一账户输出：
@@ -84,7 +84,7 @@ loader 在执行 helper 前校验 SHA-256，执行后再核对 helper name、acc
 ## 离线验证
 
 ```powershell
-.\run_tests.ps1 -PythonExe python
+.\run_tests.ps1
 ```
 
 验证覆盖源模板 SHA-256、ASCII/Python 3.6 生成合同、单账户与占位阻断、固定性能参数、loader 防篡改、身份保护、幂等 guard、维护让路、回调与撤单兼容性。测试使用根 `.env.example` 且显式开启 `--allow-example --ignore-process-env`，不会产生可部署配置。

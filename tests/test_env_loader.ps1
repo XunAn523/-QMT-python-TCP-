@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-. (Join-Path $Root 'tools\Load-ProjectEnv.ps1')
+. (Join-Path $Root 'tools\Resolve-ProjectPython.ps1')
 $EnvFile = Join-Path $Root '.env.example'
 $Original = [Environment]::GetEnvironmentVariable('QMT_LOCAL_TCP_PORT', 'Process')
 $OriginalBind = [Environment]::GetEnvironmentVariable('QMT_LOCAL_BIND_HOST', 'Process')
@@ -32,6 +32,27 @@ try {
     if ($null -ne [Environment]::GetEnvironmentVariable('QMT_LOCAL_BIND_HOST', 'Process')) {
         throw 'A parse failure leaked a partially imported environment.'
     }
+
+    $ExpectedPython = [IO.Path]::GetFullPath((Join-Path $Root '.venv\Scripts\python.exe'))
+    $ResolvedDefault = Resolve-QmtProjectPython -ProjectRoot $Root -EnvFile $EnvFile
+    if (-not $ResolvedDefault.Equals($ExpectedPython, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The default project Python did not resolve to .venv.'
+    }
+    $ResolvedExplicit = Resolve-QmtProjectPython `
+        -ProjectRoot $Root `
+        -PythonExe '.venv\Scripts\python.exe'
+    if (-not $ResolvedExplicit.Equals($ExpectedPython, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The explicit project Python did not resolve to .venv.'
+    }
+    $ForeignRejected = $false
+    try {
+        Resolve-QmtProjectPython -ProjectRoot $Root -PythonExe 'tools\project_env.py' | Out-Null
+    }
+    catch {
+        if ($_.Exception.Message -notlike '*must resolve to this project*') { throw }
+        $ForeignRejected = $true
+    }
+    if (-not $ForeignRejected) { throw 'A project-external Python override was accepted.' }
 }
 finally {
     [Environment]::SetEnvironmentVariable('QMT_LOCAL_TCP_PORT', $Original, 'Process')
@@ -39,4 +60,4 @@ finally {
     [Environment]::SetEnvironmentVariable('QMT_LOCAL_AUTH_TOKEN', $OriginalAuth, 'Process')
     if (Test-Path -LiteralPath $InvalidFile) { Remove-Item -LiteralPath $InvalidFile -Force }
 }
-Write-Host 'PowerShell project .env parser/no-leak contract passed.' -ForegroundColor Green
+Write-Host 'PowerShell project .env parser/no-leak/.venv contract passed.' -ForegroundColor Green

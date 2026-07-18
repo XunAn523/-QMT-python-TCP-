@@ -2,7 +2,7 @@
 
 `bigqmt_gateway_proxy.py` 是外置策略与大 QMT Helper 之间唯一的桥。它只绑定根 `.env` 指定的 `127.0.0.1:<TCP_PORT>`，不读取第二份 `.env`，也不接受人工维护的部署 JSON。
 
-启动入口位于项目根：
+首次部署先在项目根执行 `.\setup_venv.ps1`。日常启动入口也位于项目根：
 
 ```powershell
 .\start_gateway.ps1
@@ -11,7 +11,7 @@
 脚本从根 `.env` 生成 `gateway_config.json`，执行生产预检，再传给网关。直接启动 Python 文件时仍必须同时提供生成配置和 `.env` 解析出的日志目录：
 
 ```powershell
-python .\网关\bigqmt_gateway_proxy.py --config C:\Quant\QmtLocalBridge\generated\gateway_config.json --log-dir C:\Quant\QmtLocalBridge\logs
+& '.\.venv\Scripts\python.exe' .\网关\bigqmt_gateway_proxy.py --config C:\Quant\QmtLocalBridge\generated\gateway_config.json --log-dir C:\Quant\QmtLocalBridge\logs
 ```
 
 推荐始终使用根脚本。加载器会拒绝非回环监听、非单账户配置、缺失 runtime，以及被削弱的协议/性能常量。

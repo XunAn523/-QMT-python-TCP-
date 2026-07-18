@@ -1,9 +1,11 @@
 [CmdletBinding()]
-param([string]$PythonExe = 'python')
+param([string]$PythonExe)
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path $Root -Parent
+. (Join-Path $ProjectRoot 'tools\Resolve-ProjectPython.ps1')
+$PythonExe = Resolve-QmtProjectPython -ProjectRoot $ProjectRoot -PythonExe $PythonExe
 $EnvExample = Join-Path $ProjectRoot '.env.example'
 $Build = Join-Path ([IO.Path]::GetTempPath()) ('qmt-local-helper-' + [guid]::NewGuid().ToString('N'))
 $LocationPushed = $false

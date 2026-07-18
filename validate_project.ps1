@@ -1,8 +1,10 @@
 [CmdletBinding()]
-param([string]$PythonExe = 'python')
+param([string]$PythonExe)
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $Root 'tools\Resolve-ProjectPython.ps1')
+$PythonExe = Resolve-QmtProjectPython -ProjectRoot $Root -PythonExe $PythonExe
 $Generated = Join-Path ([IO.Path]::GetTempPath()) ('qmt-local-project-' + [guid]::NewGuid().ToString('N'))
 $PreviousDontWriteBytecode = [Environment]::GetEnvironmentVariable('PYTHONDONTWRITEBYTECODE', 'Process')
 $Pushed = $false
@@ -15,7 +17,11 @@ try {
 import ast
 from pathlib import Path
 
-paths = sorted(path for path in Path('.').rglob('*.py') if '__pycache__' not in path.parts)
+excluded = {'.git', '.venv', '__pycache__'}
+paths = sorted(
+    path for path in Path('.').rglob('*.py')
+    if not excluded.intersection(path.parts)
+)
 for path in paths:
     ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
 print('syntax_check=ok files=%d' % len(paths))

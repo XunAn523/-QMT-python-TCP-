@@ -12,16 +12,17 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $EnvFile) { $EnvFile = Join-Path $Root '.env' }
 elseif (-not [IO.Path]::IsPathRooted($EnvFile)) { $EnvFile = Join-Path $Root $EnvFile }
 $EnvFile = [IO.Path]::GetFullPath($EnvFile)
-. (Join-Path $Root 'tools\Load-ProjectEnv.ps1')
+. (Join-Path $Root 'tools\Resolve-ProjectPython.ps1')
 $OfflineBuild = $null
 try {
     if ($Deploy -and $AllowExample) { throw 'Example accounts can never be deployed.' }
     if ($Deploy -and -not $ConfirmStoppedStrategy) {
         throw 'Deployment requires -ConfirmStoppedStrategy after the QMT strategy is stopped.'
     }
-    $Values = Read-QmtLocalEnv -Path $EnvFile
-    if (-not $PythonExe) { $PythonExe = [string]$Values['QMT_LOCAL_PYTHON_EXE'] }
-    if (-not $PythonExe) { $PythonExe = 'python' }
+    $PythonExe = Resolve-QmtProjectPython `
+        -ProjectRoot $Root `
+        -EnvFile $EnvFile `
+        -PythonExe $PythonExe
 
     $SummaryArgs = @('-B', (Join-Path $Root 'tools\project_env.py'), '--env-file', $EnvFile, '--describe')
     if ($AllowExample) { $SummaryArgs += '--allow-example' }

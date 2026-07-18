@@ -23,6 +23,7 @@ PROTOCOL_VERSION = 2
 KEY_PATTERN = re.compile(r"^QMT_LOCAL_[A-Z0-9_]+$")
 LOCAL_DRIVE = re.compile(r"^[A-Za-z]:$")
 ACCOUNT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")
+VENV_PYTHON_RELATIVE = r".venv\Scripts\python.exe"
 
 BASE_KEYS = {
     "QMT_LOCAL_PYTHON_EXE",
@@ -157,6 +158,17 @@ def local_windows_path(value: str, label: str) -> str:
     return normalized
 
 
+def project_python_path(value: str, label: str) -> str:
+    """Resolve the one supported project-local virtual-environment interpreter."""
+    normalized = ntpath.normpath(value.strip())
+    if ntpath.normcase(normalized) != ntpath.normcase(VENV_PYTHON_RELATIVE):
+        raise EnvConfigError(
+            "%s must remain %s; run setup_venv.ps1 instead of using a system Python path"
+            % (label, VENV_PYTHON_RELATIVE)
+        )
+    return str((ROOT / ".venv" / "Scripts" / "python.exe").resolve())
+
+
 def require_disjoint_directories(paths: Mapping[str, str]) -> None:
     normalized = {
         label: ntpath.normcase(ntpath.normpath(path)).rstrip("\\")
@@ -213,7 +225,9 @@ def build_configs(values: Mapping[str, str], allow_example: bool = False) -> Dic
     ):
         raise EnvConfigError("QMT_LOCAL_ACCOUNT_ID is an example placeholder")
 
-    python_exe = local_windows_path(values["QMT_LOCAL_PYTHON_EXE"], "QMT_LOCAL_PYTHON_EXE")
+    python_exe = project_python_path(
+        values["QMT_LOCAL_PYTHON_EXE"], "QMT_LOCAL_PYTHON_EXE"
+    )
     runtime_root = local_windows_path(values["QMT_LOCAL_RUNTIME_ROOT"], "QMT_LOCAL_RUNTIME_ROOT")
     log_dir = local_windows_path(values["QMT_LOCAL_LOG_DIR"], "QMT_LOCAL_LOG_DIR")
     generated_dir = local_windows_path(values["QMT_LOCAL_GENERATED_DIR"], "QMT_LOCAL_GENERATED_DIR")

@@ -2,11 +2,13 @@
 
 `qmt_local_api` 面向同一台 Windows 上的普通 CPython 策略。它只从项目根 `.env` 及 `tools/project_env.py` 获取配置，固定连接 IPv4 loopback。每次新连接首帧只发送一次 64 位令牌和账户身份，且只在 PONG build/账户完整匹配后暴露 ready；心跳不重发令牌。
 
-安装：
+首次在项目根初始化：
 
 ```powershell
-python -m pip install -e ".\外置策略API"
+.\setup_venv.ps1
 ```
+
+脚本会通过项目 `.venv` 中的 `.pth` 文件离线暴露 `qmt_local_api`，本地 API 无需执行 `pip install -e`。策略需要第三方依赖时，才使用 `& '.\.venv\Scripts\python.exe' -m pip install <依赖名>` 安装到项目虚拟环境；策略进程也必须由该解释器启动。
 
 最小代码：
 

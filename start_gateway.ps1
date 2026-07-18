@@ -9,12 +9,13 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $EnvFile) { $EnvFile = Join-Path $Root '.env' }
 elseif (-not [IO.Path]::IsPathRooted($EnvFile)) { $EnvFile = Join-Path $Root $EnvFile }
 $EnvFile = [IO.Path]::GetFullPath($EnvFile)
-. (Join-Path $Root 'tools\Load-ProjectEnv.ps1')
+. (Join-Path $Root 'tools\Resolve-ProjectPython.ps1')
 $Pushed = $false
 try {
-    $Values = Read-QmtLocalEnv -Path $EnvFile
-    if (-not $PythonExe) { $PythonExe = [string]$Values['QMT_LOCAL_PYTHON_EXE'] }
-    if (-not $PythonExe) { $PythonExe = 'python' }
+    $PythonExe = Resolve-QmtProjectPython `
+        -ProjectRoot $Root `
+        -EnvFile $EnvFile `
+        -PythonExe $PythonExe
     Push-Location $Root
     $Pushed = $true
 

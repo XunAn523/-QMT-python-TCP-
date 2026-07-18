@@ -47,6 +47,10 @@ class ProjectEnvTest(unittest.TestCase):
         self.assertFalse(deployment["account_enabled"])
         self.assertEqual(deployment["bind_host"], "127.0.0.1")
         self.assertEqual(deployment["tcp_port"], 9550)
+        self.assertEqual(
+            Path(deployment["python_exe"]),
+            (ROOT / ".venv" / "Scripts" / "python.exe").resolve(),
+        )
         self.assertEqual(len(deployment["gateway_config"]["accounts"]), 1)
         self.assertFalse(deployment["qmt_config"]["helper_settings"]["ENABLE_TRADING"])
         self.assertFalse(deployment["qmt_config"]["helper_settings"]["ENABLE_CANCEL_ORDER"])
@@ -89,6 +93,8 @@ class ProjectEnvTest(unittest.TestCase):
             ({r"QMT_LOCAL_RUNTIME_ROOT=C:\Quant\QmtLocalBridge\runtime": r"QMT_LOCAL_RUNTIME_ROOT=C:\Quant\本机桥\runtime"}, "printable ASCII"),
             ({r"QMT_LOCAL_RUNTIME_ROOT=C:\Quant\QmtLocalBridge\runtime": r"QMT_LOCAL_RUNTIME_ROOT=C:\Quant\runtime:ads"}, "forbidden path"),
             ({r"QMT_LOCAL_HELPER_OUTPUT_DIR=C:\Quant\QmtLocalBridge\helper-build": r"QMT_LOCAL_HELPER_OUTPUT_DIR=C:\Quant\QmtLocalBridge\helpers"}, "non-nested"),
+            ({r"QMT_LOCAL_PYTHON_EXE=.venv\Scripts\python.exe": r"QMT_LOCAL_PYTHON_EXE=C:\Python312\python.exe"}, "must remain"),
+            ({r"QMT_LOCAL_PYTHON_EXE=.venv\Scripts\python.exe": r"QMT_LOCAL_PYTHON_EXE=..\Python312\python.exe"}, "must remain"),
         ]
         for replacements, message in cases:
             with self.subTest(message=message):
@@ -157,6 +163,9 @@ class ProjectEnvTest(unittest.TestCase):
         self.assertEqual(helper["COMMAND_INTERVAL_MS"], 25)
         self.assertEqual(helper["COMMAND_BUDGET_MS"], 15.0)
         keys = project_env.parse_env_file(self.example)
+        self.assertEqual(
+            keys["QMT_LOCAL_PYTHON_EXE"], project_env.VENV_PYTHON_RELATIVE
+        )
         self.assertFalse(any("TIMEOUT" in key or "QUEUE_SIZE" in key for key in keys))
         self.assertEqual(deployment["api_config"]["auth_token"], EXAMPLE_AUTH_TOKEN)
         self.assertNotIn(EXAMPLE_AUTH_TOKEN, json.dumps(gateway))

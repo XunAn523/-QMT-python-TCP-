@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 
 class IdempotencyConflict(RuntimeError):
@@ -41,6 +42,11 @@ def qmt_correlation_value(event: Dict[str, Any]) -> str:
 
 
 class OrderCorrelationStore:
+    EVENT_QUERY_CHUNK_SIZE = 400
+    MAX_EVENT_BATCH_SIZE = 4096
+    MAX_CLEANUP_ROWS_PER_KIND = 10000
+    MIN_COMPLETED_RETENTION_SECONDS = 7 * 24 * 60 * 60.0
+
     STAGE_RANK = {
         "RESERVED": 0,
         "BRIDGE_QUEUED": 1,
@@ -63,6 +69,22 @@ class OrderCorrelationStore:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
+        self._stage_rank_sql = "CASE stage %s ELSE -1 END" % " ".join(
+            "WHEN '%s' THEN %d" % (stage.replace("'", "''"), rank)
+            for stage, rank in self.STAGE_RANK.items()
+        )
+        self._terminal_stages = tuple(sorted(self.TERMINAL_STAGES))
+        self._update_stage_sql = (
+            "UPDATE order_correlation SET stage=?, "
+            "order_id=COALESCE(NULLIF(?,''),order_id), "
+            "order_sysid=COALESCE(NULLIF(?,''),order_sysid), updated_at=?, "
+            "terminal_at=COALESCE(?,terminal_at) "
+            "WHERE account_id=? AND client_order_id=? "
+            "AND stage NOT IN (%s) AND (%s) <= ?"
+        ) % (
+            ",".join("?" for _ in self._terminal_stages),
+            self._stage_rank_sql,
+        )
         self._db.executescript(
             """
             CREATE TABLE IF NOT EXISTS order_correlation (
@@ -91,11 +113,38 @@ class OrderCorrelationStore:
             ON order_correlation(account_id, order_id);
             CREATE INDEX IF NOT EXISTS idx_order_correlation_order_sysid
             ON order_correlation(account_id, order_sysid);
+            CREATE INDEX IF NOT EXISTS idx_order_correlation_terminal_at
+            ON order_correlation(terminal_at) WHERE terminal_at IS NOT NULL;
             CREATE TABLE IF NOT EXISTS gateway_event_dedupe (
                 account_id TEXT NOT NULL,
                 event_id TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 PRIMARY KEY (account_id, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gateway_event_dedupe_created_at
+            ON gateway_event_dedupe(created_at);
+            CREATE TABLE IF NOT EXISTS gateway_pending_response (
+                account_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                item_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (account_id, request_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gateway_pending_response_updated_at
+            ON gateway_pending_response(updated_at);
+            CREATE TABLE IF NOT EXISTS gateway_effect_request (
+                account_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                result_json TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (account_id, request_id)
             );
             """
         )
@@ -121,6 +170,48 @@ class OrderCorrelationStore:
                 if name not in refreshed:
                     raise
             columns.add(name)
+        pending_response_columns = {
+            str(row[1])
+            for row in self._db.execute(
+                "PRAGMA table_info(gateway_pending_response)"
+            ).fetchall()
+        }
+        if "fingerprint" not in pending_response_columns:
+            try:
+                self._db.execute(
+                    "ALTER TABLE gateway_pending_response "
+                    "ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                refreshed = {
+                    str(row[1])
+                    for row in self._db.execute(
+                        "PRAGMA table_info(gateway_pending_response)"
+                    ).fetchall()
+                }
+                if "fingerprint" not in refreshed:
+                    raise
+        effect_request_columns = {
+            str(row[1])
+            for row in self._db.execute(
+                "PRAGMA table_info(gateway_effect_request)"
+            ).fetchall()
+        }
+        # Existing fingerprint-only rows may already have reached QMT.  They
+        # migrate to UNKNOWN, never PREPARED, so an upgrade cannot re-execute
+        # an old trading effect after Helper guard retention expires.
+        for name, definition in (
+            ("state", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+            ("result_json", "TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if name in effect_request_columns:
+                continue
+            self._db.execute(
+                "ALTER TABLE gateway_effect_request ADD COLUMN %s %s"
+                % (name, definition)
+            )
+            effect_request_columns.add(name)
         self._db.commit()
 
     @staticmethod
@@ -206,7 +297,164 @@ class OrderCorrelationStore:
             except Exception:
                 self._db.rollback()
                 raise
-        return self.get(account_id, client_order_id) or dict(item), False
+        return {
+            "account_id": account_id,
+            "client_order_id": client_order_id,
+            "trace_id": str(item.get("trace_id") or ""),
+            "msg_id": str(item.get("msg_id") or ""),
+            "request_id": str(item.get("request_id") or ""),
+            "qmt_user_order_id": qmt_user_order_id,
+            "trader_name": str(item.get("trader_name") or ""),
+            "authenticated_trader_key": authenticated_trader_key,
+            "side": str(item.get("side") or "").strip().upper(),
+            "order_type": order_type,
+            "intent_hash": intent_hash,
+            "stage": str(item.get("stage") or "RESERVED"),
+            "order_id": None,
+            "order_sysid": None,
+            "created_at": ts,
+            "updated_at": ts,
+            "terminal_at": None,
+        }, False
+
+    def release_reservation(
+        self,
+        account_id: str,
+        client_order_id: str,
+        intent_hash: str,
+    ) -> bool:
+        """Release only an exact reservation that has not entered execution."""
+        account = str(account_id or "")
+        client_order = str(client_order_id or "")
+        intent = str(intent_hash or "")
+        if not account or not client_order or not intent:
+            raise ValueError("account_id/client_order_id/intent_hash are required")
+        with self._lock:
+            try:
+                cursor = self._db.execute(
+                    "DELETE FROM order_correlation "
+                    "WHERE account_id=? AND client_order_id=? "
+                    "AND intent_hash=? AND stage='RESERVED'",
+                    (account, client_order, intent),
+                )
+                self._db.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def release_unstarted_order(
+        self,
+        account_id: str,
+        client_order_id: str,
+        intent_hash: str,
+        request_id: str = "",
+        pending_fingerprint: str = "",
+    ) -> bool:
+        """Atomically release an order and its async ledger before enqueue.
+
+        Both deletes are conditional.  This method must never remove a row
+        that has advanced beyond RESERVED or a pending response owned by a
+        different effect fingerprint.
+        """
+        account = str(account_id or "")
+        client_order = str(client_order_id or "")
+        intent = str(intent_hash or "")
+        request = str(request_id or "")
+        fingerprint = str(pending_fingerprint or "")
+        if not account or not client_order or not intent:
+            raise ValueError("account_id/client_order_id/intent_hash are required")
+        if bool(request) != bool(fingerprint):
+            raise ValueError(
+                "request_id and pending_fingerprint must be provided together"
+            )
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    "DELETE FROM order_correlation "
+                    "WHERE account_id=? AND client_order_id=? "
+                    "AND intent_hash=? AND stage='RESERVED'",
+                    (account, client_order, intent),
+                )
+                if cursor.rowcount != 1:
+                    raise IdempotencyConflict(
+                        "order reservation is not an exact RESERVED state"
+                    )
+                if request:
+                    pending_cursor = self._db.execute(
+                        "DELETE FROM gateway_pending_response "
+                        "WHERE account_id=? AND request_id=? AND fingerprint=?",
+                        (account, request, fingerprint),
+                    )
+                    if pending_cursor.rowcount == 0 and self._db.execute(
+                        "SELECT 1 FROM gateway_pending_response "
+                        "WHERE account_id=? AND request_id=?",
+                        (account, request),
+                    ).fetchone() is not None:
+                        raise IdempotencyConflict(
+                            "pending response belongs to a different effect"
+                        )
+                    state_cursor = self._db.execute(
+                        "UPDATE gateway_effect_request SET state='PREPARED',"
+                        "result_json='',updated_at=? WHERE account_id=? "
+                        "AND request_id=? AND fingerprint=? "
+                        "AND state IN ('PREPARED','DISPATCHING')",
+                        (time.time(), account, request, fingerprint),
+                    )
+                    if state_cursor.rowcount != 1:
+                        raise IdempotencyConflict(
+                            "effect request is not an exact retryable record"
+                        )
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def release_unstarted_cancel(
+        self,
+        account_id: str,
+        request_id: str,
+        fingerprint: str,
+    ) -> bool:
+        account = str(account_id or "")
+        request = str(request_id or "")
+        effect_fingerprint = str(fingerprint or "")
+        if not account or not request or not effect_fingerprint:
+            raise ValueError("account_id/request_id/fingerprint are required")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                pending_cursor = self._db.execute(
+                    "DELETE FROM gateway_pending_response WHERE account_id=? "
+                    "AND request_id=? AND fingerprint=?",
+                    (account, request, effect_fingerprint),
+                )
+                if pending_cursor.rowcount == 0 and self._db.execute(
+                    "SELECT 1 FROM gateway_pending_response "
+                    "WHERE account_id=? AND request_id=?",
+                    (account, request),
+                ).fetchone() is not None:
+                    raise IdempotencyConflict(
+                        "pending cancel response belongs to a different effect"
+                    )
+                cursor = self._db.execute(
+                    "UPDATE gateway_effect_request SET state='PREPARED',"
+                    "result_json='',updated_at=? WHERE account_id=? "
+                    "AND request_id=? AND fingerprint=? "
+                    "AND state IN ('PREPARED','DISPATCHING')",
+                    (time.time(), account, request, effect_fingerprint),
+                )
+                if cursor.rowcount != 1:
+                    raise IdempotencyConflict(
+                        "cancel effect request is not retryable"
+                    )
+                self._db.commit()
+                return True
+            except Exception:
+                self._db.rollback()
+                raise
 
     def get(self, account_id: str, client_order_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -217,27 +465,29 @@ class OrderCorrelationStore:
 
     def update_stage(self, account_id: str, client_order_id: str, stage: str, **ids: Any) -> None:
         stage = str(stage or "")
+        stage_rank = self.STAGE_RANK.get(stage, -1)
+        ts = time.time()
+        terminal_at = ts if stage in self.TERMINAL_STAGES else None
         with self._lock:
-            row = self._db.execute(
-                "SELECT stage FROM order_correlation WHERE account_id=? AND client_order_id=?",
-                (account_id, client_order_id),
-            ).fetchone()
-            if row is None:
-                return
-            current = str(row["stage"] or "RESERVED")
-            if current in self.TERMINAL_STAGES:
-                return
-            if self.STAGE_RANK.get(stage, -1) < self.STAGE_RANK.get(current, -1):
-                return
-            terminal_at = time.time() if stage in self.TERMINAL_STAGES else None
-            self._db.execute(
-                """UPDATE order_correlation SET stage=?, order_id=COALESCE(NULLIF(?,''),order_id),
-                order_sysid=COALESCE(NULLIF(?,''),order_sysid), updated_at=?,
-                terminal_at=COALESCE(?,terminal_at) WHERE account_id=? AND client_order_id=?""",
-                (stage, str(ids.get("order_id") or ""), str(ids.get("order_sysid") or ""),
-                 time.time(), terminal_at, account_id, client_order_id),
-            )
-            self._db.commit()
+            try:
+                self._db.execute(
+                    self._update_stage_sql,
+                    (
+                        stage,
+                        str(ids.get("order_id") or ""),
+                        str(ids.get("order_sysid") or ""),
+                        ts,
+                        terminal_at,
+                        account_id,
+                        client_order_id,
+                        *self._terminal_stages,
+                        stage_rank,
+                    ),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     def resolve(self, account_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         candidates = (
@@ -329,6 +579,367 @@ class OrderCorrelationStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def save_pending_response(
+        self,
+        account_id: str,
+        request_id: str,
+        item: Dict[str, Any],
+    ) -> None:
+        """Durably upsert response-delivery state before file enqueue."""
+        account = str(account_id or "").strip()
+        request = str(request_id or "").strip()
+        if not account or not request:
+            raise ValueError("account_id and request_id are required")
+        if not isinstance(item, dict):
+            raise TypeError("pending response item must be a dict")
+        kind = str(item.get("kind") or "").strip().lower()
+        fingerprint = str(item.get("fingerprint") or "").strip()
+        if not kind or not fingerprint:
+            raise IdempotencyConflict(
+                "pending response kind and fingerprint are required"
+            )
+        stored_item = dict(item)
+        stored_item["kind"] = kind
+        stored_item["fingerprint"] = fingerprint
+        encoded = json.dumps(
+            stored_item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        timestamp = time.time()
+        with self._lock:
+            try:
+                cursor = self._db.execute(
+                    "INSERT INTO gateway_pending_response("
+                    "account_id,request_id,kind,fingerprint,item_json,"
+                    "created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(account_id,request_id) DO UPDATE SET "
+                    "item_json=excluded.item_json,updated_at=excluded.updated_at "
+                    "WHERE gateway_pending_response.kind=excluded.kind "
+                    "AND gateway_pending_response.fingerprint=excluded.fingerprint",
+                    (
+                        account,
+                        request,
+                        kind,
+                        fingerprint,
+                        encoded,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise IdempotencyConflict(
+                        "request_id is already bound to a different pending response"
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def load_pending_responses(
+        self,
+        account_id: str,
+        limit: int = 4096,
+    ) -> list[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 10000))
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT request_id,kind,fingerprint,item_json "
+                "FROM gateway_pending_response "
+                "WHERE account_id=? ORDER BY created_at,request_id LIMIT ?",
+                (str(account_id or ""), safe_limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                item = json.loads(str(row["item_json"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "invalid persisted pending response: %s" % row["request_id"]
+                ) from exc
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "persisted pending response is not an object: %s"
+                    % row["request_id"]
+                )
+            item["request_id"] = str(row["request_id"])
+            item["kind"] = str(row["kind"] or "")
+            item["fingerprint"] = str(row["fingerprint"] or "")
+            result.append(item)
+        return result
+
+    def adopt_legacy_pending_response(
+        self,
+        account_id: str,
+        request_id: str,
+        pending_kind: str,
+        effect_kind: str,
+        fingerprint: str,
+        item: Dict[str, Any],
+    ) -> None:
+        """Atomically bind a pre-fingerprint pending row fail-closed."""
+        account = str(account_id or "").strip()
+        request = str(request_id or "").strip()
+        normalized_pending_kind = str(pending_kind or "").strip().lower()
+        normalized_effect_kind = str(effect_kind or "").strip().lower()
+        normalized_fingerprint = str(fingerprint or "").strip()
+        if not all((
+            account,
+            request,
+            normalized_pending_kind,
+            normalized_effect_kind,
+            normalized_fingerprint,
+        )):
+            raise ValueError("legacy pending response identity is incomplete")
+        stored_item = dict(item)
+        stored_item["kind"] = normalized_pending_kind
+        stored_item["fingerprint"] = normalized_fingerprint
+        encoded = json.dumps(
+            stored_item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        timestamp = time.time()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    "UPDATE gateway_pending_response SET kind=?,fingerprint=?,"
+                    "item_json=?,updated_at=? WHERE account_id=? AND request_id=? "
+                    "AND fingerprint=''",
+                    (
+                        normalized_pending_kind,
+                        normalized_fingerprint,
+                        encoded,
+                        timestamp,
+                        account,
+                        request,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise IdempotencyConflict(
+                        "legacy pending response was already adopted or changed"
+                    )
+                effect_cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO gateway_effect_request("
+                    "account_id,request_id,kind,fingerprint,state,result_json,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        account,
+                        request,
+                        normalized_effect_kind,
+                        normalized_fingerprint,
+                        "UNKNOWN",
+                        "",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                if effect_cursor.rowcount != 1:
+                    existing = self._db.execute(
+                        "SELECT kind,fingerprint FROM gateway_effect_request "
+                        "WHERE account_id=? AND request_id=?",
+                        (account, request),
+                    ).fetchone()
+                    if (
+                        existing is None
+                        or str(existing["kind"] or "") != normalized_effect_kind
+                        or str(existing["fingerprint"] or "")
+                        != normalized_fingerprint
+                    ):
+                        raise IdempotencyConflict(
+                            "legacy pending response conflicts with effect registry"
+                        )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def reserve_effect_request(
+        self,
+        account_id: str,
+        request_id: str,
+        kind: str,
+        fingerprint: str,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Permanently bind an effectful request id to one kind and fingerprint."""
+        account = str(account_id or "").strip()
+        request = str(request_id or "").strip()
+        normalized_kind = str(kind or "").strip().lower()
+        normalized_fingerprint = str(fingerprint or "").strip()
+        if not account or not request:
+            raise ValueError("account_id and request_id are required")
+        if not normalized_kind or not normalized_fingerprint:
+            raise IdempotencyConflict(
+                "effect request kind and fingerprint are required"
+            )
+        created_at = time.time()
+        record = {
+            "account_id": account,
+            "request_id": request,
+            "kind": normalized_kind,
+            "fingerprint": normalized_fingerprint,
+            "state": "PREPARED",
+            "result": None,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO gateway_effect_request("
+                    "account_id,request_id,kind,fingerprint,state,result_json,"
+                    "created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        account,
+                        request,
+                        normalized_kind,
+                        normalized_fingerprint,
+                        "PREPARED",
+                        "",
+                        created_at,
+                        created_at,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    self._db.commit()
+                    return record, False
+                row = self._db.execute(
+                    "SELECT account_id,request_id,kind,fingerprint,state,"
+                    "result_json,created_at,updated_at "
+                    "FROM gateway_effect_request "
+                    "WHERE account_id=? AND request_id=?",
+                    (account, request),
+                ).fetchone()
+                existing = self._decode_effect_request_row(row)
+                if (
+                    existing is not None
+                    and str(existing.get("kind") or "") == normalized_kind
+                    and str(existing.get("fingerprint") or "")
+                    == normalized_fingerprint
+                ):
+                    self._db.commit()
+                    return existing, True
+                raise IdempotencyConflict(
+                    "request_id is already bound to a different effect request"
+                )
+            except Exception:
+                self._db.rollback()
+                raise
+
+    @staticmethod
+    def _decode_effect_request_row(
+        row: Optional[sqlite3.Row],
+    ) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        result = dict(row)
+        encoded = str(result.pop("result_json", "") or "")
+        if not encoded:
+            result["result"] = None
+            return result
+        try:
+            decoded = json.loads(encoded)
+        except (TypeError, ValueError):
+            decoded = None
+        result["result"] = decoded if isinstance(decoded, dict) else None
+        return result
+
+    def transition_effect_request(
+        self,
+        account_id: str,
+        request_id: str,
+        fingerprint: str,
+        state: str,
+        result: Optional[Dict[str, Any]] = None,
+        allowed_from: Iterable[str] = ("PREPARED",),
+    ) -> bool:
+        normalized_state = str(state or "").strip().upper()
+        allowed = tuple(
+            str(value or "").strip().upper()
+            for value in allowed_from
+            if str(value or "").strip()
+        )
+        if normalized_state not in {
+            "PREPARED", "DISPATCHING", "ENQUEUED", "UNKNOWN", "TERMINAL"
+        }:
+            raise ValueError("invalid effect request state")
+        if not allowed:
+            raise ValueError("allowed_from must not be empty")
+        if result is not None and not isinstance(result, dict):
+            raise TypeError("effect request result must be a dict")
+        encoded = (
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if result is not None
+            else None
+        )
+        placeholders = ",".join("?" for _ in allowed)
+        with self._lock:
+            try:
+                cursor = self._db.execute(
+                    "UPDATE gateway_effect_request SET state=?,"
+                    "result_json=CASE WHEN ? IS NULL THEN result_json ELSE ? END,"
+                    "updated_at=? WHERE account_id=? AND request_id=? "
+                    "AND fingerprint=? AND state IN (%s)" % placeholders,
+                    (
+                        normalized_state,
+                        encoded,
+                        encoded,
+                        time.time(),
+                        str(account_id or "").strip(),
+                        str(request_id or "").strip(),
+                        str(fingerprint or "").strip(),
+                        *allowed,
+                    ),
+                )
+                self._db.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def get_effect_request(
+        self,
+        account_id: str,
+        request_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._decode_effect_request_row(
+                self._db.execute(
+                    "SELECT account_id,request_id,kind,fingerprint,state,"
+                    "result_json,created_at,updated_at "
+                    "FROM gateway_effect_request "
+                    "WHERE account_id=? AND request_id=?",
+                    (str(account_id or "").strip(), str(request_id or "").strip()),
+                ).fetchone()
+            )
+
+    def remove_pending_response(self, account_id: str, request_id: str) -> None:
+        with self._lock:
+            try:
+                self._db.execute(
+                    "DELETE FROM gateway_pending_response "
+                    "WHERE account_id=? AND request_id=?",
+                    (str(account_id or ""), str(request_id or "")),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
     def event_seen(self, account_id: str, event_id: str) -> bool:
         if not event_id:
             return False
@@ -338,15 +949,157 @@ class OrderCorrelationStore:
                 (account_id, event_id),
             ).fetchone() is not None
 
+    @classmethod
+    def _normalize_event_ids(cls, event_ids: Iterable[str]) -> list[str]:
+        if isinstance(event_ids, (str, bytes)):
+            raise TypeError("event_ids must be an iterable of event id values")
+        result = []
+        seen = set()
+        for raw_value in event_ids:
+            if not raw_value:
+                continue
+            value = str(raw_value)
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+            if len(result) > cls.MAX_EVENT_BATCH_SIZE:
+                raise ValueError(
+                    "event batch exceeds maximum size %d" % cls.MAX_EVENT_BATCH_SIZE
+                )
+        return result
+
+    def events_seen_many(self, account_id: str, event_ids: Iterable[str]) -> Set[str]:
+        """Return the subset of event ids already committed as delivered."""
+        values = self._normalize_event_ids(event_ids)
+        if not values:
+            return set()
+        result: Set[str] = set()
+        with self._lock:
+            for offset in range(0, len(values), self.EVENT_QUERY_CHUNK_SIZE):
+                chunk = values[offset:offset + self.EVENT_QUERY_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._db.execute(
+                    "SELECT event_id FROM gateway_event_dedupe "
+                    "WHERE account_id=? AND event_id IN (%s)" % placeholders,
+                    [account_id, *chunk],
+                ).fetchall()
+                result.update(str(row["event_id"]) for row in rows)
+        return result
+
+    def mark_events(self, account_id: str, event_ids: Iterable[str]) -> int:
+        """Atomically mark a bounded event batch and return newly inserted rows."""
+        values = self._normalize_event_ids(event_ids)
+        if not values:
+            return 0
+        created_at = time.time()
+        with self._lock:
+            before = self._db.total_changes
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.executemany(
+                    "INSERT OR IGNORE INTO gateway_event_dedupe"
+                    "(account_id,event_id,created_at) VALUES (?,?,?)",
+                    ((account_id, event_id, created_at) for event_id in values),
+                )
+                inserted = self._db.total_changes - before
+                self._db.commit()
+                return int(inserted)
+            except Exception:
+                self._db.rollback()
+                raise
+
     def mark_event(self, account_id: str, event_id: str) -> None:
         if not event_id:
             return
-        with self._lock:
-            self._db.execute(
-                "INSERT OR IGNORE INTO gateway_event_dedupe(account_id,event_id,created_at) VALUES (?,?,?)",
-                (account_id, event_id, time.time()),
+        self.mark_events(account_id, [event_id])
+
+    @classmethod
+    def _validate_cleanup_limit(cls, value: int, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("%s must be an integer" % name)
+        if value < 0 or value > cls.MAX_CLEANUP_ROWS_PER_KIND:
+            raise ValueError(
+                "%s must be between 0 and %d"
+                % (name, cls.MAX_CLEANUP_ROWS_PER_KIND)
             )
-            self._db.commit()
+        return value
+
+    def cleanup_completed(
+        self,
+        before: float,
+        event_limit: int = 1000,
+        order_limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """Delete only old delivered events and terminal orders in bounded batches."""
+        try:
+            cutoff = float(before)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("before must be a finite timestamp") from exc
+        if not math.isfinite(cutoff):
+            raise ValueError("before must be a finite timestamp")
+        newest_allowed = time.time() - self.MIN_COMPLETED_RETENTION_SECONDS
+        if cutoff > newest_allowed:
+            raise ValueError(
+                "before must retain at least %.0f seconds of completed state"
+                % self.MIN_COMPLETED_RETENTION_SECONDS
+            )
+        event_limit = self._validate_cleanup_limit(event_limit, "event_limit")
+        order_limit = self._validate_cleanup_limit(order_limit, "order_limit")
+        result: Dict[str, Any] = {
+            "before": cutoff,
+            "events_deleted": 0,
+            "orders_deleted": 0,
+        }
+        if event_limit == 0 and order_limit == 0:
+            return result
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if event_limit:
+                    before_changes = self._db.total_changes
+                    self._db.execute(
+                        "DELETE FROM gateway_event_dedupe WHERE rowid IN ("
+                        "SELECT rowid FROM gateway_event_dedupe "
+                        "WHERE created_at < ? ORDER BY created_at, rowid LIMIT ?)",
+                        (cutoff, event_limit),
+                    )
+                    result["events_deleted"] = (
+                        self._db.total_changes - before_changes
+                    )
+                if order_limit:
+                    before_changes = self._db.total_changes
+                    placeholders = ",".join("?" for _ in self._terminal_stages)
+                    self._db.execute(
+                        "DELETE FROM order_correlation WHERE rowid IN ("
+                        "SELECT rowid FROM order_correlation "
+                        "WHERE terminal_at IS NOT NULL AND terminal_at < ? "
+                        "AND stage IN (%s) "
+                        "ORDER BY terminal_at, rowid LIMIT ?)" % placeholders,
+                        (cutoff, *self._terminal_stages, order_limit),
+                    )
+                    result["orders_deleted"] = (
+                        self._db.total_changes - before_changes
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return result
+
+    def checkpoint_wal(self) -> Dict[str, int]:
+        """Run a non-blocking PASSIVE WAL checkpoint for an explicitly idle period."""
+        with self._lock:
+            if self._db.in_transaction:
+                raise RuntimeError("cannot checkpoint WAL during an active transaction")
+            row = self._db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        if row is None:
+            return {"busy": 0, "log_frames": 0, "checkpointed_frames": 0}
+        return {
+            "busy": int(row[0] or 0),
+            "log_frames": int(row[1] or 0),
+            "checkpointed_frames": int(row[2] or 0),
+        }
 
     def close(self) -> None:
         with self._lock:

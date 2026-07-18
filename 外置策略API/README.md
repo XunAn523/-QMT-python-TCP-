@@ -43,9 +43,9 @@ finally:
 - `connect(timeout=None) -> bool`、`stop(timeout=5)`；
 - `on(message_type, handler)`、`off(message_type, handler)`；
 - `query(query_type='', params=None, timeout=None)`；
-- `place_order_async(symbol, side, quantity, price, *, client_order_id, ...) -> msg_id`；
-- `cancel_order_async(order_id) -> msg_id`；
-- `cancel_order_by_sysid_async(market, order_sysid) -> msg_id`；
+- `place_order_async(symbol, side, quantity, price, *, client_order_id, request_id='', ...) -> msg_id`；
+- `cancel_order_async(order_id, *, request_id='') -> msg_id`；
+- `cancel_order_by_sysid_async(market, order_sysid, *, request_id='') -> msg_id`；
 - `wait_delivery_acknowledged(delivery_id, timeout=2) -> bool`。
 
 完整下单构造签名：
@@ -55,6 +55,7 @@ build_order_request(
     symbol, side, quantity, price,
     *,
     client_order_id,
+    request_id="",
     price_type=11,
     order_type=0,
     strategy_name="qmt_local_api",
@@ -72,9 +73,9 @@ build_order_request(
 )
 ```
 
-`send_order_async`/`place_order_async` 使用同一组参数并直接发送。撤单构造为 `build_cancel_request(order_id, async_mode=False)` 或 `build_cancel_sysid_request(market, order_sysid, async_mode=False)`。
+`send_order_async`/`place_order_async` 使用同一组参数并直接发送。撤单构造为 `build_cancel_request(order_id, *, async_mode=False, request_id='')` 或 `build_cancel_sysid_request(market, order_sysid, *, async_mode=False, request_id='')`。
 
-`client_order_id` 是业务幂等键，同一订单意图跨连接重试时必须保持不变；同一个键带不同订单参数会被拒绝。`qmt_user_order_id` 最长 23 字符。建议省略 `intent_hash`，由 Gateway 按规范字段计算。
+`client_order_id` 是下单业务幂等键；`request_id` 是 NEW/CANCEL 交易副作用的网关幂等键。同一交易意图跨连接重试时可使用新的 `msg_id`，但必须复用原 `request_id`；省略或只传空白时保持原行为。`qmt_user_order_id` 最长 23 字符。建议省略 `intent_hash`，由 Gateway 按规范字段计算。
 
 ## 示例
 
@@ -85,4 +86,4 @@ build_order_request(
 - `示例/async_order.py`：默认 dry-run 的异步下单；
 - `示例/async_cancel.py`：默认 dry-run 的异步撤单。
 
-异步下单的 `ASYNC_ORDER` 只表示 Gateway 排队结果，`ASYNC_ORDER_RESPONSE` 才表示 Helper/QMT 提交结果，最终成交状态以 `ORDER_UPDATE`/`TRADE_NOTIFY` 为准。超时、断线或 `SUBMIT_UNKNOWN` 不得自动重复下单。
+异步下单的 `ASYNC_ORDER` 只表示 Gateway 排队结果，`ASYNC_ORDER_RESPONSE` 才表示 Helper/QMT 提交结果；异步撤单同理，`ASYNC_CANCEL` 之后还会收到可靠的 `ASYNC_CANCEL_RESPONSE`。撤单调用结果仍不是券商最终终态，最终订单/成交状态以 `ORDER_UPDATE`/`TRADE_NOTIFY` 为准。超时、断线或 `SUBMIT_UNKNOWN` 不得自动重复产生交易副作用。

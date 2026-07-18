@@ -114,7 +114,7 @@ Gateway 响应：
   "msg_id": "ping-unique-id",
   "protocol_version": 2,
   "gateway": "local_qmt_gateway",
-  "build_id": "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io",
+  "build_id": "xuanling_local_qmt_gateway_20260718_low_latency_v7_post_enqueue_barrier",
   "account_id": "REPLACE_WITH_REAL_QMT_ACCOUNT_ID",
   "account_name": "account_main",
   "qmt_status": {
@@ -151,13 +151,13 @@ Gateway 响应：
 | `account_name` | 首帧和所有 QUERY/交易/撤单帧必填的单账户逻辑名 |
 | `auth_token` | 仅首帧 PING 携带的 64 位十六进制密钥，禁止记录/回显 |
 | `timestamp` | Unix 秒，诊断用，不能作为幂等键 |
-| `request_id` | Helper 文件请求相关 ID，通常由 Gateway 派生 |
+| `request_id` | 交易副作用的永久幂等 ID；未提供时按 `client_order_id`、`msg_id` 顺序回退，仍为空才生成新值 |
 | `client_order_id` | 业务订单幂等键，跨重连/状态查询保持稳定 |
 | `qmt_user_order_id` | 传给 QMT 的关联键，最多 23 字符 |
 | `delivery_id` | 可靠回调幂等键，持久化后用于 ACK |
 | `trace_id` | 外置链路追踪 ID，不替代 `client_order_id` |
 
-`msg_id` 标识一次线请求，`client_order_id` 标识业务订单；二者不能混用。网络重试可以产生新 `msg_id`，但同一业务订单必须保留原 `client_order_id`。
+`msg_id` 标识一次线请求，`client_order_id` 标识业务订单，`request_id` 标识一次可能产生真实 QMT 副作用的下单/撤单动作；三者不能混用。网络重试可以产生新 `msg_id`，但必须保留原 `request_id` 和原 `client_order_id`。Gateway 会把 effect `request_id` 永久绑定到规范动作指纹：同 ID、同参数读取已有状态，同 ID、不同参数返回 `REQUEST_ID_CONFLICT`。只有明确返回 `effect_started=false` 的前置拒绝才允许用同一组幂等键退避重试；`DISPATCHING`/`EFFECT_STATE_UNKNOWN`/`SUBMIT_UNKNOWN` 一律先对账。
 
 ## 6. 查询
 
@@ -296,6 +296,7 @@ msg_id = api.place_order_async(
 {
   "type": "CANCEL_ASYNC",
   "msg_id": "cancel-001",
+  "request_id": "cancel-001",
   "account_id": "REPLACE_WITH_REAL_QMT_ACCOUNT_ID",
   "account_name": "account_main",
   "order_id": "QMT_ORDER_ID",
@@ -309,6 +310,7 @@ msg_id = api.place_order_async(
 {
   "type": "CANCEL_SYSID_ASYNC",
   "msg_id": "cancel-002",
+  "request_id": "cancel-002",
   "account_id": "REPLACE_WITH_REAL_QMT_ACCOUNT_ID",
   "account_name": "account_main",
   "market": 0,
@@ -317,7 +319,24 @@ msg_id = api.place_order_async(
 }
 ```
 
-异步响应 `ASYNC_CANCEL status=SENT cancel_status=queued` 仅表示已排队；异步响应没有 `final`。同步撤单的 `EXEC_REPORT cancel_status=cancel_sent final=false` 只表示已发送。两者最终都必须等待 `ORDER_UPDATE` 中券商/QMT 的真实终态。
+即时响应 `ASYNC_CANCEL status=SENT cancel_status=queued` 仅表示已排队。Helper 完成撤单调用后，Gateway 会以带 `delivery_id` 的 `ASYNC_CANCEL_RESPONSE` 可靠回传 `CANCEL_SUBMITTED`、`REJECTED` 或 `SUBMIT_UNKNOWN`；收到并持久化后必须发送 `DELIVERY_ACK`。该响应的 `final=false`，同步撤单的 `EXEC_REPORT cancel_status=cancel_sent final=false` 也只表示已发送；最终都必须等待 `ORDER_UPDATE` 中券商/QMT 的真实终态。
+
+```json
+{
+  "protocol_version": 2,
+  "type": "ASYNC_CANCEL_RESPONSE",
+  "stage": "CANCEL_SUBMITTED",
+  "status": "SENT",
+  "msg_id": "cancel-001",
+  "request_id": "cancel-001",
+  "account_id": "REPLACE_WITH_REAL_QMT_ACCOUNT_ID",
+  "order_id": "QMT_ORDER_ID",
+  "cancel_status": "done",
+  "final": false,
+  "delivery_id": "response:cancel-001:CANCEL_SUBMITTED",
+  "timestamp": 1784257203.04
+}
+```
 
 API：
 
@@ -331,6 +350,7 @@ api.cancel_order_by_sysid_async(0, "BROKER_ORDER_SYSID")
 可靠与否以当前实例是否带非空 `delivery_id` 为准。常见可靠实例包括：
 
 - `ASYNC_ORDER_RESPONSE`；
+- `ASYNC_CANCEL_RESPONSE`；
 - Helper 文件事件产生的 `ORDER_UPDATE`/`TRADE_NOTIFY`；
 - `ORDER_ERROR`；
 - 文件队列产生的其他带 `delivery_id` 事件。
@@ -354,7 +374,9 @@ ACK：
 }
 ```
 
-这是至少一次语义，因此 handler 不能只做内存打印后 ACK。`示例/common.py` 使用 SQLite `delivery_id PRIMARY KEY`、WAL/FULL 和事务提交；`callback_client.py` 演示长期消费。Helper 实时文件事件投递失败累计三次后会移入 `events/failed`、停止自动重投并发送 `RECONCILE_REQUIRED`；`ASYNC_ORDER_RESPONSE` 使用独立的 pending response 重投机制。
+这是至少一次语义，因此 handler 不能只做内存打印后 ACK。`示例/common.py` 使用 SQLite `delivery_id PRIMARY KEY`、WAL/FULL 和事务提交；`callback_client.py` 演示长期消费。Helper 实时文件事件投递失败累计三次后会移入 `events/failed`、停止自动重投并发送 `RECONCILE_REQUIRED`；`ASYNC_ORDER_RESPONSE` 和 `ASYNC_CANCEL_RESPONSE` 使用独立的 pending response 重投机制。
+
+Gateway 每次等待 `DELIVERY_ACK` 的窗口为 1 秒。handler 应只完成远低于 1 秒的幂等事务落库，慢计算在提交后转交独立队列；否则会发生重复投递并可能进入 `delivery_degraded`。Helper 文件事件必须带稳定非空 `event_id`，缺失时 Gateway 拒绝投递并进入重试/对账路径，不能退化为每次生成不同 ID。
 
 `query_account.py` 是短命只读进程：如果意外收到可靠事件，它会让 handler 抛错并拒绝 ACK，避免吞掉生产回调。
 
@@ -367,6 +389,7 @@ ACK：
 | `ASYNC_ORDER` | Gateway 即时排队/拒绝结果 |
 | `ASYNC_ORDER_RESPONSE` | Helper/QMT 提交结果，可靠 |
 | `ASYNC_CANCEL` | 异步撤单排队/拒绝结果 |
+| `ASYNC_CANCEL_RESPONSE` | Helper/QMT 撤单调用结果，可靠；不是券商最终终态 |
 | `EXEC_REPORT` | 同步动作响应或兼容执行回报 |
 | `ORDER_UPDATE` | QMT 订单状态；带 `delivery_id` 的 Helper 文件回调可靠，无该字段的快照差分为 best-effort |
 | `TRADE_NOTIFY` | QMT 成交状态；带 `delivery_id` 的 Helper 文件回调可靠，无该字段的快照差分为 best-effort |
@@ -391,12 +414,17 @@ ACK：
 | `CLIENT_ORDER_ID_REQUIRED` | 生成稳定业务幂等 ID 后再提交 |
 | `HELPER_NOT_READY` | 不下单，检查大 QMT 策略和三份 health |
 | `IDEMPOTENCY_CONFLICT` | 同一业务 ID 参数冲突，人工调查 |
+| `REQUEST_ID_CONFLICT` | 同一副作用 ID 已绑定到不同动作或参数，停止发送并调查 |
+| `EFFECT_STATE_UNKNOWN` | 已跨过持久化调度屏障，是否到达 QMT 无法证明；禁止重发 |
+| `EFFECT_ALREADY_ENQUEUED` / `EFFECT_ALREADY_FINALIZED` | 原副作用已有持久化状态，读取结果或对账，不创建新 ID |
 | `INTENT_HASH_MISMATCH` | 删除自造 hash 或按规范计算 |
 | `FRAME_TOO_LARGE` | 缩小查询范围/响应 |
 | `GATEWAY_BUSY` | `effect_started=false` 表示尚未写交易队列、未调用 Helper；按退避策略使用相同幂等 ID 重试，不要生成新 ID |
 | `SUBMIT_UNKNOWN` | 不自动重发，按关联键对账 |
 | `POST_ENQUEUE_STATE_UNCERTAIN` | 可能已经产生副作用，不自动重发 |
 | `RECONCILE_REQUIRED` | 查询订单/成交并人工或规则化对账 |
+
+Helper v12 在 native 调用前必须完整证明同一 `request_id` 的所有排队 sibling 一致。目录打开或枚举失败、匹配文件元数据/内容不可读，以及扫描或候选预算不足，统一返回 `RECONCILE_REQUIRED` 且 `stage=SUBMIT_UNKNOWN`，并保证本次不调用 `passorder/cancel`。该结果表示需要对账，不表示可以换新 ID 重发。
 
 TCP 发送成功不等于 QMT 接受；`ASYNC_ORDER SENT` 也不等于 QMT 接受。Gateway 可能在即时 `ASYNC_ORDER` 中返回终止性 `REJECTED` 或不确定 `SUBMIT_UNKNOWN`；已排队后则以可靠 `ASYNC_ORDER_RESPONSE` 和后续 QMT 回调推进状态。
 
@@ -411,13 +439,15 @@ api.stop(timeout=5.0)
 api.on(message_type, handler)
 api.off(message_type, handler)
 api.query(query_type="", params=None, timeout=None) -> dict | None
-api.place_order_async(symbol, side, quantity, price, *, client_order_id, ...) -> str
-api.cancel_order_async(order_id) -> str
-api.cancel_order_by_sysid_async(market, order_sysid) -> str
+api.place_order_async(symbol, side, quantity, price, *, client_order_id, request_id="", ...) -> str
+api.cancel_order_async(order_id, *, request_id="") -> str
+api.cancel_order_by_sysid_async(market, order_sysid, *, request_id="") -> str
 api.wait_delivery_acknowledged(delivery_id, timeout=2.0) -> bool
 ```
 
 下单完整可选参数定义在 `qmt_local_api/client.py::build_order_request`，包括 `price_type`、`order_type`、`strategy_name`、`order_remark`、`trace_id`、`qmt_user_order_id`、认证字段、credit mode 和意图字段。二次开发应优先封装 public API，不应调用 transport 私有 reader。
+
+显式 `request_id` 会去除首尾空白；空值保持兼容默认。需要在网络前置失败后用同一副作用键重试时，可以创建新的 `msg_id`，但必须传回原 `request_id`。这项能力不表示允许重试 `SUBMIT_UNKNOWN`；只有响应明确 `effect_started=false` 才可使用。
 
 ## 13. 原始 socket 标准实例
 
@@ -480,8 +510,8 @@ api.wait_delivery_acknowledged(delivery_id, timeout=2.0) -> bool
 
 ## 15. 性能与安全验收
 
-二次开发不得改变：单 reader、全发送锁、10 MiB、首帧令牌+protocol+account 认证、PONG build/account 身份、带 `delivery_id` 实例在 handler 成功后 ACK、SQLite writer lease、10ms watcher、25ms Helper command、500ms query、15ms command budget、每周期最多4条交易命令，以及副作用前有界背压。
+二次开发不得改变：单 reader、全发送锁、10 MiB、首帧令牌+protocol+account 认证、PONG build/account 身份、带 `delivery_id` 实例在 handler 成功后 ACK、SQLite writer lease、目录通知只作唤醒且保留 10ms 超时回退、100ms Helper 健康集中采样与 200ms fail-closed 缓存、25ms Helper command、500ms query、15ms command budget、每周期最多4条交易命令，以及副作用前的固定容量 I/O/磁盘队列背压。
 
 发布前测试至少覆盖：分片、粘包、非法长度、非 UTF-8、非 object、非有限数字、缺失/错误令牌、protocol/account 逐一错配、未认证连接无法抢占 primary、错误账户零副作用、Gateway 双开、缺失/相同/冲突订单 ID、ACK 丢失重投、handler 失败、查询 waiter、Helper 离线、断线重连和 `SUBMIT_UNKNOWN` 不重发。
 
-真实大 QMT 验收还需要小额下单/撤单与 P50/P95/P99 非劣比较；离线 loopback 测试不能证明券商链路延迟或成交结果。
+真实大 QMT 验收还需要小额下单/撤单、目标版本 `passorder/cancel` 签名与返回值确认，以及 P50/P95/P99 非劣比较；离线 loopback 测试不能证明券商链路延迟或成交结果。文件原子替换和 SQLite WAL/NORMAL 只承诺进程崩溃下的保守恢复，不承诺断电或磁盘缓存丢失后的端到端 exactly-once。

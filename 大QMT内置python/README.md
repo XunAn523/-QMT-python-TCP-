@@ -15,7 +15,7 @@
 └─ run_tests.ps1
 ```
 
-helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard`，与网关的 `expected_helper_build_id` 一致。
+helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latency_v12_fail_closed_sibling_scan`，与网关的 `expected_helper_build_id` 一致。v12 要求同一 `request_id` 的排队 sibling 扫描必须完整；目录打开、迭代或匹配项元数据读取失败，以及扫描/候选预算不足，都会在 native 下单/撤单前以 `SUBMIT_UNKNOWN` 失败关闭。
 
 ## 唯一配置入口
 
@@ -39,10 +39,14 @@ helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latenc
 - command 25ms、query 500ms、command budget 15ms、readiness 100ms；
 - 每 tick 最多 4 个 command、1 个 query，交易时查询、reconcile 和 maintenance 均为交易命令让路；
 - heartbeat 1s、reconcile 30s、maintenance 60s；
-- request guard TTL 604800s、文件寿命 86400s、每轮清理 100 个、低优先级安静期 1s；
+- request guard TTL 604800s、普通失败/归档文件寿命 86400s、每轮最多删除 100 个且全局最多扫描 512 项、低优先级安静期 1s；可靠的 `responses` 和 `events/live` 不由 Helper 按 TTL 删除；
 - run-time timer 开启、quick trade 2、默认委托类型 1101、QMT user order ID 最长 23。
 
 回调只做标准化和单次原子写入，不查询、不休眠、不重试、不联网。`request_id` guard 保证委托进入 processing 后不会重放；账号、类型、helper name、runtime、build 任一不一致都 fail closed。
+
+新格式命令文件名为 `<20位入队序号>-<request_id的UTF-8 SHA-256>.json`，JSON 内仍保留原始 `request_id`。Helper 在固定扫描上限内按文件名选择最早命令，并在 `inbox/commands`、`processing/commands`、v1 根队列、恢复文件、旧安全文件名、response 和 Guard 间做同一副作用预检。只要指纹、嵌入 ID、动作、账户或完整 QMT 调用参数不能证明一致，就写入 `SUBMIT_UNKNOWN`，不会调用 `passorder/cancel`。
+
+Helper 启动维护会恢复 processing 崩溃现场：没有 Guard 的 claim 可原样返回队列；已有 processing Guard 的请求只能进入不确定状态；已有 final Guard 可重建 response。撤单与下单一样，原生 QMT 调用抛出异常后绝不尝试第二种签名或再次调用。目标大 QMT 版本的 `cancel` 签名和返回值必须先在模拟账户验证，再开启撤单。
 
 ## 生成、校验和加载
 
@@ -87,7 +91,7 @@ loader 在执行 helper 前校验 SHA-256，执行后再核对 helper name、acc
 .\run_tests.ps1
 ```
 
-验证覆盖源模板 SHA-256、ASCII/Python 3.6 生成合同、单账户与占位阻断、固定性能参数、loader 防篡改、身份保护、幂等 guard、维护让路、回调与撤单兼容性。测试使用根 `.env.example` 且显式开启 `--allow-example --ignore-process-env`，不会产生可部署配置。
+验证覆盖源模板 SHA-256、ASCII/Python 3.6 生成合同、单账户与占位阻断、固定性能参数、loader 防篡改、身份保护、response/Guard 单读幂等、processing 恢复、哈希/旧格式/序号 sibling 冲突、积压命令顺序、目录消失单次恢复、全局 512 项维护扫描预算与目录轮转、维护让路、回调与撤单单次调用。测试使用根 `.env.example` 且显式开启 `--allow-example --ignore-process-env`，不会产生可部署配置。
 
 ## 安全边界
 

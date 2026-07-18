@@ -7,7 +7,9 @@ to compile a fail-closed, account-bound helper, then load the installed
 bigqmt_loader.py in QMT. Generated helpers open no TCP/HTTP ports or threads.
 """
 
+import hashlib
 import json
+import math
 import os
 import time
 import traceback
@@ -42,8 +44,20 @@ DEFAULT_REMARK = "local_tcp_signal"
 PASSORDER_QUICK_TRADE = 2
 QMT_ORDER_TYPE_DEFAULT = 1101
 QMT_USER_ORDER_ID_MAX_LENGTH = 23
-BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
+BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v12_fail_closed_sibling_scan"
 # XUANLING_HELPER_CONFIG_END
+
+
+# Bound maintenance metadata work independently from the delete budget. This is
+# intentionally a fixed build-time safety limit, not a deployment knob.
+MAX_CLEANUP_SCAN_ENTRIES_PER_TICK = 512
+MAX_PROCESSING_RECOVERY_FILES_PER_TICK = 8
+MAX_COMMAND_SIBLING_PREFLIGHT_FILES = 32
+MAX_COMMAND_SIBLING_SCAN_ENTRIES_PER_REQUEST = 512
+MAX_REQUEST_QUEUE_SCAN_ENTRIES_PER_CYCLE = 512
+MAX_STALE_ATOMIC_TMP_FILES_PER_TICK = 32
+MAX_STALE_ATOMIC_TMP_SCAN_ENTRIES_PER_TICK = 256
+STALE_ATOMIC_TMP_AGE_SECONDS = 300.0
 
 
 INBOX_DIR = os.path.join(RUNTIME_DIR, "inbox")
@@ -97,10 +111,29 @@ G_METRICS = {
     "command_timer_overrun_total": 0,
     "maintenance_deferred_for_command_total": 0,
     "callback_events_total": 0,
+    "cleanup_scanned_total": 0,
+    "cleanup_scan_budget_exhausted_total": 0,
+    "stale_tmp_cleanup_deleted_total": 0,
+    "stale_tmp_cleanup_scanned_total": 0,
+    "stale_tmp_cleanup_scan_budget_exhausted_total": 0,
+    "processing_recovery_total": 0,
+    "processing_recovery_returned_total": 0,
+    "processing_recovery_completed_total": 0,
+    "processing_recovery_uncertain_total": 0,
+    "processing_recovery_failed_total": 0,
+    "processing_recovery_error_total": 0,
+    "queued_sibling_conflict_total": 0,
+    "queued_sibling_scan_incomplete_total": 0,
+    "request_queue_scan_failed_total": 0,
+    "request_queue_scan_limit_exceeded_total": 0,
+    "request_queue_scan_unreadable_total": 0,
     "last_request_elapsed_ms": 0.0,
     "last_snapshot_elapsed_ms": 0.0,
 }
 G_PROCESSING_REQUEST_IDS = set()
+G_CLEANUP_FOLDER_CURSOR = 0
+G_STALE_TMP_CLEANUP_FOLDER_CURSOR = 0
+G_PROCESSING_RECOVERY_FOLDER_CURSOR = 0
 
 
 ORDER_STATUS_TEXT_MAP = {
@@ -196,6 +229,10 @@ def _safe_filename(value):
     return name or _make_request_id("file")
 
 
+def _request_file_key(request_id):
+    return hashlib.sha256(_safe_str(request_id).encode("utf-8")).hexdigest()
+
+
 def _set_last_error(message):
     global G_LAST_ERROR
     G_LAST_ERROR = _safe_str(message)
@@ -228,22 +265,42 @@ def ensure_runtime_dirs():
         _ensure_dir(path)
 
 
-def _atomic_write_json(path, payload):
+def _atomic_write_json(path, payload, ensure_parent=True):
     parent = os.path.dirname(path)
-    if parent:
+    if parent and ensure_parent:
         _ensure_dir(parent)
-    tmp = "%s.%s.%d.tmp" % (path, os.getpid(), int(_now() * 1000000))
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, default=_json_default, sort_keys=True)
-        f.write("\n")
-    try:
-        os.replace(tmp, path)
-    except Exception:
+    recovered_parent = False
+    while True:
+        tmp = "%s.%s.%d.tmp" % (path, os.getpid(), int(_now() * 1000000))
         try:
-            os.remove(tmp)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    payload,
+                    f,
+                    ensure_ascii=False,
+                    default=_json_default,
+                    separators=(",", ":"),
+                )
+                f.write("\n")
+            os.replace(tmp, path)
+            return
+        except FileNotFoundError:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            if ensure_parent or not parent or recovered_parent:
+                raise
+            # Runtime directories are created during init. Recover once if an
+            # operator or external process removed one after initialization.
+            _ensure_dir(parent)
+            recovered_parent = True
         except Exception:
-            pass
-        raise
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            raise
 
 
 def _safe_runtime_write(label, func, *args):
@@ -271,57 +328,76 @@ def _move_file(src, dest_dir):
 
 
 def _request_guard_path(request_id):
+    return os.path.join(REQUEST_STATE_DIR, _request_file_key(request_id) + ".json")
+
+
+def _legacy_request_guard_path(request_id):
     return os.path.join(REQUEST_STATE_DIR, _safe_filename(request_id) + ".json")
 
 
 def _read_request_guard(request_id):
-    path = _request_guard_path(request_id)
-    if not os.path.exists(path):
+    record, conflict, _, migrations = _resolve_artifact_pair(
+        request_id,
+        _request_guard_path(request_id),
+        _legacy_request_guard_path(request_id),
+        "guard",
+    )
+    if conflict:
         return None
-    try:
-        data = _read_json(path)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    _apply_artifact_migrations(migrations)
+    return record
 
 
 def _write_request_guard(request_id, state, request, response=None):
     payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    fingerprint = _safe_str(
+        request.get("gateway_effect_fingerprint")
+        or payload.get("gateway_effect_fingerprint")
+    )
     guard = {
         "request_id": request_id,
         "state": state,
+        "action": _safe_str(request.get("action")),
+        "account_id": _safe_str(request.get("account_id") or ACCOUNT_ID),
         "trace_id": _safe_str(request.get("trace_id") or payload.get("trace_id")),
         "client_order_id": _safe_str(request.get("client_order_id") or payload.get("client_order_id")),
         "qmt_user_order_id": _safe_str(request.get("qmt_user_order_id") or payload.get("qmt_user_order_id")),
+        "intent_hash": _safe_str(request.get("intent_hash") or payload.get("intent_hash")),
+        "cancel_order_id": _safe_str(payload.get("order_id")),
+        "cancel_order_sysid": _safe_str(payload.get("order_sysid")),
         "updated_at": _now(),
     }
+    if fingerprint:
+        guard["gateway_effect_fingerprint"] = fingerprint
+    _apply_request_effect_metadata(guard, request)
     if isinstance(response, dict):
         guard["response"] = response
-    _atomic_write_json(_request_guard_path(request_id), guard)
+    _atomic_write_json(_request_guard_path(request_id), guard, False)
     return guard
 
 
-def _duplicate_response(request_id):
-    request_id = _safe_str(request_id)
-    if not request_id:
-        return None
-    path = _response_path(request_id)
-    if os.path.exists(path):
-        try:
-            response = _read_json(path)
-            if isinstance(response, dict):
-                response["idempotent"] = True
-                response["duplicate_stage"] = "helper_response"
-                return response
-        except Exception:
-            pass
-    item = _read_request_guard(request_id)
-    if isinstance(item, dict) and isinstance(item.get("response"), dict):
-        response = dict(item.get("response"))
+def _duplicate_state(request):
+    resolution = _resolve_request_artifacts(request)
+    if resolution.get("conflict"):
+        return _fail_closed_artifact_conflict(request, resolution), None
+    response = resolution.get("response")
+    guard = resolution.get("guard")
+    if isinstance(response, dict):
+        response = dict(response)
+        response["idempotent"] = True
+        response["duplicate_stage"] = "helper_response"
+        return response, guard
+    if isinstance(guard, dict) and isinstance(guard.get("response"), dict):
+        response = dict(guard.get("response"))
         response["idempotent"] = True
         response["duplicate_stage"] = "helper_guard"
-        return response
-    return None
+        return response, guard
+    return None, guard
+
+
+def _duplicate_response(request):
+    response, _ = _duplicate_state(request)
+    return response
 
 
 def _qmt_func(name):
@@ -631,8 +707,93 @@ def normalize_account(obj):
     }
 
 
+def _canonical_qmt_effect(request):
+    request = request if isinstance(request, dict) else {}
+    action = _safe_str(request.get("action"), "").strip()
+    payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    account_id = _safe_str(request.get("account_id") or ACCOUNT_ID, "").strip()
+    account_type = _safe_str(request.get("account_type") or ACCOUNT_TYPE, "").strip()
+    if not action or not account_id or not account_type:
+        return None, "action and account identity are required"
+    if action == "place_order":
+        try:
+            args = build_order_args(payload)
+        except Exception as exc:
+            return None, "place_order arguments are invalid: %s" % _safe_str(exc)
+        op_type = _safe_int(args.get("op_type"), 0)
+        return {
+            "action": action,
+            "account_id": account_id,
+            "account_type": account_type,
+            "op_type": op_type,
+            "qmt_order_type": _safe_int(args.get("order_type"), 0),
+            "symbol": _safe_str(args.get("symbol"), ""),
+            "price_type": _safe_int(args.get("price_type"), 0),
+            "raw_price": _safe_float(args.get("price"), 0.0),
+            "quantity": args.get("quantity"),
+            "strategy_name": _safe_str(args.get("strategy_name"), ""),
+            "order_remark": _safe_str(args.get("order_remark"), ""),
+            "qmt_user_order_id": _safe_str(args.get("user_order_id"), ""),
+            "quick_trade": _safe_int(args.get("quick_trade"), 0),
+            "side": _safe_str(args.get("side"), ""),
+            "passorder_signature": (
+                "direct_cash_repay" if op_type in (32, 75) else "standard"
+            ),
+        }, ""
+    if action == "cancel_order":
+        order_id = _safe_str(payload.get("order_id"), "").strip()
+        order_sysid = _safe_str(payload.get("order_sysid"), "").strip()
+        target_order_id = order_id or order_sysid
+        if not target_order_id:
+            return None, "cancel_order target is required"
+        return {
+            "action": action,
+            "account_id": account_id,
+            "account_type": account_type,
+            "qmt_account_type": qmt_account_type(),
+            "order_id": order_id,
+            "order_sysid": order_sysid,
+            "target_order_id": target_order_id,
+            "market": _safe_str(payload.get("market"), ""),
+        }, ""
+    return None, "unsupported guarded action=%s" % action
+
+
+def _request_effect_metadata(request):
+    request = request if isinstance(request, dict) else {}
+    payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    metadata = {
+        "action": _safe_str(request.get("action")),
+        "account_id": _safe_str(request.get("account_id") or ACCOUNT_ID),
+        "client_order_id": _safe_str(
+            request.get("client_order_id") or payload.get("client_order_id")
+        ),
+        "intent_hash": _safe_str(request.get("intent_hash") or payload.get("intent_hash")),
+        "cancel_order_id": _safe_str(payload.get("order_id")),
+        "cancel_order_sysid": _safe_str(payload.get("order_sysid")),
+    }
+    fingerprint = _safe_str(
+        request.get("gateway_effect_fingerprint")
+        or payload.get("gateway_effect_fingerprint")
+    )
+    if fingerprint:
+        metadata["gateway_effect_fingerprint"] = fingerprint
+    qmt_effect, _ = _canonical_qmt_effect(request)
+    if isinstance(qmt_effect, dict):
+        metadata["qmt_effect"] = qmt_effect
+    return metadata
+
+
+def _apply_request_effect_metadata(target, request):
+    metadata = _request_effect_metadata(request)
+    for key, value in metadata.items():
+        if value:
+            target[key] = value
+    return target
+
+
 def make_response(ok, data=None, error="", code="", request=None, action=""):
-    return {
+    response = {
         "version": 1,
         "ok": bool(ok),
         "request_id": _safe_str((request or {}).get("request_id"), ""),
@@ -646,6 +807,7 @@ def make_response(ok, data=None, error="", code="", request=None, action=""):
         "finished_at": _now(),
         "build_id": BUILD_ID,
     }
+    return _apply_request_effect_metadata(response, request)
 
 
 def qmt_get_details(data_type):
@@ -835,6 +997,30 @@ def call_passorder(args, context):
     )
 
 
+def _normalize_passorder_order_id(result):
+    if result is None or isinstance(result, bool):
+        return ""
+    if isinstance(result, int):
+        return _safe_str(result, "").strip() if result > 0 else ""
+    if isinstance(result, float):
+        return _safe_str(result, "").strip() if math.isfinite(result) and result > 0 else ""
+    if not isinstance(result, str):
+        return ""
+    text = result.strip()
+    lowered = text.lower()
+    if lowered in (
+        "", "0", "none", "null", "nil", "false", "no", "undefined",
+        "nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity",
+        "fail", "failed", "failure", "error", "reject", "rejected",
+    ):
+        return ""
+    try:
+        numeric = float(text)
+    except Exception:
+        return text
+    return text if math.isfinite(numeric) and numeric > 0 else ""
+
+
 def call_cancel(payload, context):
     func = _qmt_func("cancel")
     if not func:
@@ -842,10 +1028,10 @@ def call_cancel(payload, context):
     order_id = _safe_str(payload.get("order_id") or payload.get("order_sysid"), "")
     if not order_id:
         raise ValueError("order_id or order_sysid is required")
-    try:
-        return func(order_id, ACCOUNT_ID, qmt_account_type(), context)
-    except TypeError:
-        return func(order_id, ACCOUNT_ID, ACCOUNT_TYPE, context)
+    # A native TypeError can happen after QMT accepted the cancellation. Never
+    # retry a side-effecting call with another signature; the caller records an
+    # unknown submit state and requires reconciliation.
+    return func(order_id, ACCOUNT_ID, qmt_account_type(), context)
 
 
 def dispatch_qmt_action(context, action, payload):
@@ -872,8 +1058,7 @@ def dispatch_qmt_action(context, action, payload):
         result = call_passorder(args, context)
         passorder_finished_at = _now()
         passorder_elapsed_ms = max(0.0, (time.perf_counter() - monotonic_started) * 1000)
-        result_text = _safe_str(result, "")
-        order_id = result_text if result_text and result_text != "0" and result_text.lower() != "none" else ""
+        order_id = _normalize_passorder_order_id(result)
         status = "accepted" if order_id else "submit_unknown"
         return {
             "status": status,
@@ -900,9 +1085,14 @@ def dispatch_qmt_action(context, action, payload):
         if not ENABLE_CANCEL_ORDER:
             return {"status": "failed", "error": "cancel disabled"}
         result = call_cancel(payload, context)
-        ok = result is True or result == 0 or _safe_str(result) == "0"
+        ok = result is True or (
+            not isinstance(result, bool)
+            and (result == 0 or _safe_str(result) == "0")
+        )
         return {
-            "status": "accepted" if ok else "failed",
+            "status": "accepted" if ok else "submit_unknown",
+            "stage": "QMT_SUBMITTED" if ok else "SUBMIT_UNKNOWN",
+            "submit_result": "KNOWN" if ok else "UNKNOWN",
             "request_id": _safe_str(payload.get("request_id") or payload.get("msg_id") or ""),
             "order_id": _safe_str(payload.get("order_id") or ""),
             "order_sysid": _safe_str(payload.get("order_sysid") or ""),
@@ -918,6 +1108,10 @@ def dispatch_qmt_action(context, action, payload):
 
 
 def _response_path(request_id):
+    return os.path.join(RESPONSES_DIR, _request_file_key(request_id) + ".json")
+
+
+def _legacy_response_path(request_id):
     return os.path.join(RESPONSES_DIR, _safe_filename(request_id) + ".json")
 
 
@@ -930,7 +1124,836 @@ def _write_response(request, response):
     if "finished_at" not in response:
         response["finished_at"] = _now()
     response["elapsed_ms"] = max(0.0, (response["finished_at"] - response["started_at"]) * 1000)
-    _atomic_write_json(_response_path(request_id), response)
+    _apply_request_effect_metadata(response, request)
+    _atomic_write_json(_response_path(request_id), response, False)
+
+
+def _list_processing_recovery_files(folder, max_files):
+    files = []
+    max_files = max(0, _safe_int(max_files, 0))
+    if not max_files:
+        return files
+    entries = None
+    try:
+        entries = os.scandir(folder)
+        scanned = 0
+        for entry in entries:
+            if scanned >= max_files:
+                break
+            scanned += 1
+            if entry.is_file():
+                files.append(entry.path)
+    except Exception:
+        return files
+    finally:
+        try:
+            if entries is not None:
+                entries.close()
+        except Exception:
+            pass
+    files.sort()
+    return files
+
+
+def _return_processing_request(path, inbox_dir):
+    _ensure_dir(inbox_dir)
+    name = os.path.basename(path)
+    target = os.path.join(inbox_dir, name)
+    if os.path.exists(target):
+        base, ext = os.path.splitext(name)
+        target = os.path.join(
+            inbox_dir,
+            "%s-recovered-%d-%s%s"
+            % (base, int(_now() * 1000), uuid.uuid4().hex[:8], ext),
+        )
+    os.replace(path, target)
+    return target
+
+
+def _read_artifact_candidate(path, request_id, label):
+    try:
+        record = _read_json(path)
+    except FileNotFoundError:
+        return False, None, ""
+    except Exception as exc:
+        return True, None, "%s unreadable path=%s error=%s" % (label, path, exc)
+    if not isinstance(record, dict):
+        return True, None, "%s is not a JSON object path=%s" % (label, path)
+    embedded_request_id = _safe_str(record.get("request_id"), "")
+    if embedded_request_id != request_id:
+        return True, None, (
+            "%s embedded request_id mismatch expected=%s actual=%s path=%s"
+            % (label, request_id, embedded_request_id, path)
+        )
+    return True, record, ""
+
+
+def _same_artifact_path(left, right):
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def _resolve_artifact_pair(request_id, hashed_path, legacy_path, label):
+    hashed_present, hashed_record, hashed_error = _read_artifact_candidate(
+        hashed_path, request_id, "hashed_%s" % label
+    )
+    legacy_present = False
+    legacy_record = None
+    legacy_error = ""
+    if not _same_artifact_path(hashed_path, legacy_path):
+        legacy_present, legacy_record, legacy_error = _read_artifact_candidate(
+            legacy_path, request_id, "legacy_%s" % label
+        )
+    conflicts = [item for item in (hashed_error, legacy_error) if item]
+    if (
+        hashed_record is not None
+        and legacy_record is not None
+        and hashed_record != legacy_record
+    ):
+        conflicts.append("hashed and legacy %s contents differ" % label)
+    paths = []
+    if hashed_present:
+        paths.append(hashed_path)
+    if legacy_present:
+        paths.append(legacy_path)
+    migrations = []
+    record = hashed_record if hashed_record is not None else legacy_record
+    if not conflicts:
+        if hashed_record is None and legacy_record is not None:
+            migrations.append(("replace", legacy_path, hashed_path))
+        elif hashed_record is not None and legacy_record is not None:
+            migrations.append(("remove", legacy_path, ""))
+    return record, "; ".join(conflicts), paths, migrations
+
+
+def _apply_artifact_migrations(migrations):
+    succeeded = True
+    for action, source, target in migrations:
+        try:
+            if action == "replace":
+                os.replace(source, target)
+            elif action == "remove":
+                os.remove(source)
+            G_METRICS["legacy_artifact_migrated_total"] = (
+                G_METRICS.get("legacy_artifact_migrated_total", 0) + 1
+            )
+        except FileNotFoundError:
+            if action == "replace" and not os.path.isfile(target):
+                succeeded = False
+        except Exception as exc:
+            succeeded = False
+            _set_last_error("legacy artifact migration failed path=%s: %s" % (source, exc))
+    return succeeded
+
+
+def _artifact_records(response, guard):
+    records = []
+    if isinstance(response, dict):
+        records.append(response)
+    if isinstance(guard, dict):
+        records.append(guard)
+        guard_response = guard.get("response")
+        if isinstance(guard_response, dict):
+            records.append(guard_response)
+    return records
+
+
+def _artifact_values(records, keys, include_data=False):
+    values = []
+    for record in records:
+        sources = [record]
+        if include_data and isinstance(record.get("data"), dict):
+            sources.append(record.get("data"))
+        for source in sources:
+            for key in keys:
+                value = _safe_str(source.get(key), "").strip()
+                if value:
+                    values.append(value)
+    return values
+
+
+def _required_artifact_value(label, expected, values):
+    expected = _safe_str(expected, "").strip()
+    distinct = set(values)
+    if not expected:
+        return "%s missing from incoming request" % label
+    if not distinct:
+        return "%s missing from persisted artifact" % label
+    if distinct != set([expected]):
+        return "%s mismatch expected=%s actual=%s" % (
+            label, expected, ",".join(sorted(distinct))
+        )
+    return ""
+
+
+def _artifact_effect_error(request, response, guard):
+    records = _artifact_records(response, guard)
+    if not records:
+        return ""
+    payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    expected_fingerprint = _safe_str(
+        request.get("gateway_effect_fingerprint")
+        or payload.get("gateway_effect_fingerprint")
+    ).strip()
+    stored_fingerprints = _artifact_values(
+        records, ("gateway_effect_fingerprint",)
+    )
+    fingerprint_proven = False
+    if expected_fingerprint and stored_fingerprints:
+        fingerprint_error = _required_artifact_value(
+            "gateway_effect_fingerprint",
+            expected_fingerprint,
+            stored_fingerprints,
+        )
+        if fingerprint_error:
+            return fingerprint_error
+        fingerprint_proven = all(
+            _safe_str(record.get("gateway_effect_fingerprint"), "").strip()
+            == expected_fingerprint
+            for record in records
+        )
+    elif len(set(stored_fingerprints)) > 1:
+        return "gateway_effect_fingerprint differs across persisted artifacts"
+
+    action = _safe_str(request.get("action"), "").strip()
+    account_id = _safe_str(request.get("account_id") or ACCOUNT_ID, "").strip()
+    error = _required_artifact_value(
+        "action", action, _artifact_values(records, ("action",))
+    )
+    if error:
+        return error
+    error = _required_artifact_value(
+        "account_id", account_id, _artifact_values(records, ("account_id",))
+    )
+    if error:
+        return error
+    if fingerprint_proven:
+        return ""
+    expected_effect, effect_error = _canonical_qmt_effect(request)
+    if effect_error or not isinstance(expected_effect, dict):
+        return "canonical QMT effect cannot be proven from incoming request: %s" % (
+            effect_error or "missing effect"
+        )
+    expected_effect_hash = _stable_hash(expected_effect)
+    for record in records:
+        stored_effect = record.get("qmt_effect")
+        if not isinstance(stored_effect, dict):
+            return "canonical QMT effect missing from persisted artifact"
+        if _stable_hash(stored_effect) != expected_effect_hash:
+            return "canonical QMT effect mismatch across persisted artifacts"
+    if action == "place_order":
+        client_order_id = _safe_str(
+            request.get("client_order_id") or payload.get("client_order_id")
+        ).strip()
+        intent_hash = _safe_str(
+            request.get("intent_hash") or payload.get("intent_hash")
+        ).strip()
+        error = _required_artifact_value(
+            "client_order_id",
+            client_order_id,
+            _artifact_values(records, ("client_order_id",)),
+        )
+        if error:
+            return error
+        return _required_artifact_value(
+            "intent_hash", intent_hash, _artifact_values(records, ("intent_hash",))
+        )
+    if action == "cancel_order":
+        order_sysid = _safe_str(payload.get("order_sysid"), "").strip()
+        order_id = _safe_str(payload.get("order_id"), "").strip()
+        if order_sysid:
+            return _required_artifact_value(
+                "cancel_order_sysid",
+                order_sysid,
+                _artifact_values(
+                    records,
+                    ("cancel_order_sysid", "order_sysid"),
+                    True,
+                ),
+            )
+        return _required_artifact_value(
+            "cancel_order_id",
+            order_id,
+            _artifact_values(
+                records,
+                ("cancel_order_id", "order_id"),
+                True,
+            ),
+        )
+    return "unsupported guarded action=%s" % action
+
+
+def _backfill_resolved_artifacts(request, response, guard):
+    request_id = _safe_str(request.get("request_id") or request.get("msg_id"), "")
+    if isinstance(response, dict):
+        before = dict(response)
+        _apply_request_effect_metadata(response, request)
+        if response != before:
+            _atomic_write_json(_response_path(request_id), response, False)
+    if isinstance(guard, dict):
+        before = dict(guard)
+        _apply_request_effect_metadata(guard, request)
+        guard_response = guard.get("response")
+        if isinstance(guard_response, dict):
+            guard_response = dict(guard_response)
+            _apply_request_effect_metadata(guard_response, request)
+            guard["response"] = guard_response
+        if guard != before:
+            _atomic_write_json(_request_guard_path(request_id), guard, False)
+
+
+def _resolve_request_artifacts(request):
+    request_id = _safe_str(request.get("request_id") or request.get("msg_id"), "")
+    response, response_conflict, response_paths, response_migrations = (
+        _resolve_artifact_pair(
+            request_id,
+            _response_path(request_id),
+            _legacy_response_path(request_id),
+            "response",
+        )
+    )
+    guard, guard_conflict, guard_paths, guard_migrations = _resolve_artifact_pair(
+        request_id,
+        _request_guard_path(request_id),
+        _legacy_request_guard_path(request_id),
+        "guard",
+    )
+    conflicts = [item for item in (response_conflict, guard_conflict) if item]
+    if not conflicts and (response is not None or guard is not None):
+        effect_error = _artifact_effect_error(request, response, guard)
+        if effect_error:
+            conflicts.append(effect_error)
+    migrations = response_migrations + guard_migrations
+    if not conflicts:
+        migrated = _apply_artifact_migrations(migrations)
+        if migrated:
+            try:
+                _backfill_resolved_artifacts(request, response, guard)
+            except Exception as exc:
+                _set_last_error("resolved artifact backfill failed: %s" % exc)
+    return {
+        "response": response,
+        "guard": guard,
+        "conflict": "; ".join(conflicts),
+        "paths": response_paths + guard_paths,
+    }
+
+
+def _isolate_artifact_paths(paths):
+    isolated = set()
+    _ensure_dir(FAILED_DIR)
+    for path in paths:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in isolated or not os.path.isfile(path):
+            continue
+        isolated.add(normalized)
+        try:
+            source_kind = _safe_filename(os.path.basename(os.path.dirname(path)))
+            target = os.path.join(
+                FAILED_DIR,
+                "artifact-%s-%s-%s"
+                % (source_kind, uuid.uuid4().hex[:12], os.path.basename(path)),
+            )
+            os.replace(path, target)
+        except Exception as exc:
+            _set_last_error("artifact isolation failed path=%s: %s" % (path, exc))
+
+
+def _fail_closed_artifact_conflict(request, resolution):
+    global G_RECONCILE_NEEDED
+    _isolate_artifact_paths(resolution.get("paths") or [])
+    response = _processing_recovery_unknown_response(
+        request,
+        {"state": "artifact_conflict"},
+    )
+    response["artifact_conflict"] = _safe_str(resolution.get("conflict"))
+    response["data"]["recovery_reason"] = "request_artifact_conflict"
+    response["data"]["artifact_conflict"] = response["artifact_conflict"]
+    request_id = _safe_str(request.get("request_id") or request.get("msg_id"), "")
+    _write_request_guard(request_id, "unknown", request, response)
+    G_RECONCILE_NEEDED = True
+    G_METRICS["request_artifact_conflict_total"] = (
+        G_METRICS.get("request_artifact_conflict_total", 0) + 1
+    )
+    return response
+
+
+def _queued_command_sibling_paths(request_id, current_path):
+    hashed_name = _request_file_key(request_id) + ".json"
+    legacy_name = _safe_filename(request_id) + ".json"
+    candidates = [
+        current_path,
+        os.path.join(INBOX_COMMANDS_DIR, hashed_name),
+        os.path.join(INBOX_COMMANDS_DIR, legacy_name),
+        os.path.join(PROCESSING_COMMANDS_DIR, hashed_name),
+        os.path.join(PROCESSING_COMMANDS_DIR, legacy_name),
+        os.path.join(INBOX_DIR, hashed_name),
+        os.path.join(INBOX_DIR, legacy_name),
+    ]
+    result = []
+    seen = set()
+    for path in candidates:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(path)
+    return result
+
+
+def _is_ascii_digits(value, min_length=1, max_length=0):
+    value = _safe_str(value, "")
+    if len(value) < min_length or (max_length and len(value) > max_length):
+        return False
+    return all(ch in "0123456789" for ch in value)
+
+
+def _is_lower_hex(value, length):
+    value = _safe_str(value, "")
+    return len(value) == length and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _is_regular_command_sibling_stem(stem, request_id):
+    hashed = _request_file_key(request_id)
+    legacy = _safe_filename(request_id)
+    if stem == hashed or stem == legacy:
+        return True
+    return (
+        len(stem) == 85
+        and _is_ascii_digits(stem[:20], 20, 20)
+        and stem[20:21] == "-"
+        and stem[21:] == hashed
+    )
+
+
+def _is_command_sibling_filename(filename, request_id):
+    if not filename.endswith(".json"):
+        return False
+    stem = filename[:-5]
+    if _is_regular_command_sibling_stem(stem, request_id):
+        return True
+    while True:
+        base, marker, suffix = stem.rpartition("-recovered-")
+        if not marker:
+            return False
+        parts = suffix.split("-")
+        if (
+            len(parts) != 2
+            or not _is_ascii_digits(parts[0], 10, 20)
+            or not _is_lower_hex(parts[1], 8)
+        ):
+            return False
+        stem = base
+        if _is_regular_command_sibling_stem(stem, request_id):
+            return True
+
+
+def _discover_queued_command_siblings(request_id, current_path):
+    paths = []
+    seen = set()
+    candidate_budget_exhausted = False
+    incomplete_reasons = []
+
+    def add_incomplete(reason):
+        reason = _safe_str(reason, "queued sibling scan incomplete")
+        if reason in incomplete_reasons:
+            return
+        if len(incomplete_reasons) >= MAX_COMMAND_SIBLING_PREFLIGHT_FILES:
+            return
+        incomplete_reasons.append(reason)
+
+    def add_path(path):
+        nonlocal candidate_budget_exhausted
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            return
+        if len(paths) >= MAX_COMMAND_SIBLING_PREFLIGHT_FILES:
+            candidate_budget_exhausted = True
+            return
+        seen.add(normalized)
+        paths.append(path)
+
+    # The current processing artifact is already open and parsed by the caller.
+    # All other candidates come exclusively from the complete directory scans
+    # below.  Fixed-name isfile probes cannot prove absence and only duplicate
+    # NTFS metadata work on the normal path.
+    add_path(current_path)
+
+    scanned = 0
+    scan_budget_exhausted = False
+    for folder in (INBOX_COMMANDS_DIR, PROCESSING_COMMANDS_DIR, INBOX_DIR):
+        entries = None
+        try:
+            entries = os.scandir(folder)
+        except Exception as exc:
+            add_incomplete(
+                "queued sibling scan incomplete: directory open failed "
+                "folder=%s error=%s" % (folder, exc)
+            )
+            continue
+        try:
+            try:
+                iterator = iter(entries)
+            except Exception as exc:
+                add_incomplete(
+                    "queued sibling scan incomplete: directory iteration "
+                    "setup failed folder=%s error=%s" % (folder, exc)
+                )
+                continue
+            while True:
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                except Exception as exc:
+                    add_incomplete(
+                        "queued sibling scan incomplete: directory iteration "
+                        "failed folder=%s error=%s" % (folder, exc)
+                    )
+                    break
+                # Fetch one entry past the budget so an exactly-full, complete
+                # directory is not incorrectly reported as truncated.
+                if scanned >= MAX_COMMAND_SIBLING_SCAN_ENTRIES_PER_REQUEST:
+                    scan_budget_exhausted = True
+                    break
+                scanned += 1
+                try:
+                    entry_name = entry.name
+                except Exception as exc:
+                    add_incomplete(
+                        "queued sibling scan incomplete: entry name unreadable "
+                        "folder=%s error=%s" % (folder, exc)
+                    )
+                    continue
+                if not _is_command_sibling_filename(entry_name, request_id):
+                    continue
+                try:
+                    is_file = entry.is_file()
+                except Exception as exc:
+                    add_incomplete(
+                        "queued sibling scan incomplete: matching entry metadata "
+                        "unreadable folder=%s name=%s error=%s"
+                        % (folder, entry_name, exc)
+                    )
+                    continue
+                if not is_file:
+                    continue
+                try:
+                    add_path(entry.path)
+                except Exception as exc:
+                    add_incomplete(
+                        "queued sibling scan incomplete: matching entry path "
+                        "unreadable folder=%s name=%s error=%s"
+                        % (folder, entry_name, exc)
+                    )
+        finally:
+            try:
+                if entries is not None:
+                    entries.close()
+            except Exception:
+                pass
+        if scan_budget_exhausted:
+            break
+    G_METRICS["queued_sibling_scanned_total"] = (
+        G_METRICS.get("queued_sibling_scanned_total", 0) + scanned
+    )
+    if scan_budget_exhausted:
+        G_METRICS["queued_sibling_scan_budget_exhausted_total"] = (
+            G_METRICS.get("queued_sibling_scan_budget_exhausted_total", 0) + 1
+        )
+    if candidate_budget_exhausted:
+        G_METRICS["queued_sibling_candidate_budget_exhausted_total"] = (
+            G_METRICS.get("queued_sibling_candidate_budget_exhausted_total", 0) + 1
+        )
+    if incomplete_reasons:
+        G_METRICS["queued_sibling_scan_incomplete_total"] = (
+            G_METRICS.get("queued_sibling_scan_incomplete_total", 0) + 1
+        )
+    return {
+        "paths": paths,
+        "scanned": scanned,
+        "scan_budget_exhausted": scan_budget_exhausted,
+        "candidate_budget_exhausted": candidate_budget_exhausted,
+        "scan_incomplete": bool(incomplete_reasons),
+        "incomplete_reasons": incomplete_reasons,
+    }
+
+
+def _queued_identity_value_error(label, expected, actual):
+    expected = _safe_str(expected, "").strip()
+    actual = _safe_str(actual, "").strip()
+    if not expected or not actual:
+        return "%s cannot be proven across queued siblings" % label
+    if expected != actual:
+        return "%s differs across queued siblings" % label
+    return ""
+
+
+def _queued_request_effect_error(expected, candidate):
+    expected_action = _safe_str(expected.get("action"), "").strip()
+    candidate_action = _safe_str(candidate.get("action"), "").strip()
+    error = _queued_identity_value_error(
+        "action", expected_action, candidate_action
+    )
+    if error:
+        return error
+    error = _queued_identity_value_error(
+        "account_id",
+        expected.get("account_id"),
+        candidate.get("account_id"),
+    )
+    if error:
+        return error
+    expected_payload = (
+        expected.get("payload") if isinstance(expected.get("payload"), dict) else {}
+    )
+    candidate_payload = (
+        candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+    )
+    expected_fingerprint = _safe_str(
+        expected.get("gateway_effect_fingerprint")
+        or expected_payload.get("gateway_effect_fingerprint")
+    ).strip()
+    candidate_fingerprint = _safe_str(
+        candidate.get("gateway_effect_fingerprint")
+        or candidate_payload.get("gateway_effect_fingerprint")
+    ).strip()
+    if expected_fingerprint and candidate_fingerprint:
+        return _queued_identity_value_error(
+            "gateway_effect_fingerprint",
+            expected_fingerprint,
+            candidate_fingerprint,
+        )
+    expected_effect, expected_effect_error = _canonical_qmt_effect(expected)
+    candidate_effect, candidate_effect_error = _canonical_qmt_effect(candidate)
+    if expected_effect_error or candidate_effect_error:
+        return "canonical QMT effect cannot be proven across queued siblings: %s" % (
+            expected_effect_error or candidate_effect_error
+        )
+    if (
+        not isinstance(expected_effect, dict)
+        or not isinstance(candidate_effect, dict)
+        or _stable_hash(expected_effect) != _stable_hash(candidate_effect)
+    ):
+        return "canonical QMT effect differs across queued siblings"
+    if expected_action == "place_order":
+        error = _queued_identity_value_error(
+            "client_order_id",
+            expected.get("client_order_id")
+            or expected_payload.get("client_order_id"),
+            candidate.get("client_order_id")
+            or candidate_payload.get("client_order_id"),
+        )
+        if error:
+            return error
+        return _queued_identity_value_error(
+            "intent_hash",
+            expected.get("intent_hash") or expected_payload.get("intent_hash"),
+            candidate.get("intent_hash") or candidate_payload.get("intent_hash"),
+        )
+    if expected_action == "cancel_order":
+        expected_sysid = _safe_str(expected_payload.get("order_sysid"), "").strip()
+        candidate_sysid = _safe_str(candidate_payload.get("order_sysid"), "").strip()
+        if expected_sysid or candidate_sysid:
+            return _queued_identity_value_error(
+                "cancel_order_sysid", expected_sysid, candidate_sysid
+            )
+        return _queued_identity_value_error(
+            "cancel_order_id",
+            expected_payload.get("order_id"),
+            candidate_payload.get("order_id"),
+        )
+    return "unsupported queued guarded action=%s" % expected_action
+
+
+def _preflight_command_siblings(request, current_path):
+    request_id = _safe_str(request.get("request_id") or request.get("msg_id"), "")
+    current_normalized = os.path.normcase(os.path.abspath(current_path))
+    paths = []
+    conflicts = []
+    discovery = _discover_queued_command_siblings(request_id, current_path)
+    if discovery.get("scan_budget_exhausted"):
+        conflicts.append("queued sibling scan budget exhausted")
+    if discovery.get("candidate_budget_exhausted"):
+        conflicts.append("queued sibling candidate budget exhausted")
+    conflicts.extend(discovery.get("incomplete_reasons") or [])
+    for path in discovery.get("paths") or []:
+        paths.append(path)
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized == current_normalized:
+            candidate = request
+        else:
+            try:
+                candidate = _read_json(path)
+            except FileNotFoundError:
+                # A sibling may be consumed or isolated after scandir.  Only an
+                # explicit not-found race is safe to treat as disappeared.
+                continue
+            except Exception as exc:
+                conflicts.append("queued sibling unreadable: %s" % exc)
+                continue
+            if not isinstance(candidate, dict):
+                conflicts.append("queued sibling is not a JSON object")
+                continue
+        embedded_request_id = _safe_str(
+            candidate.get("request_id") or candidate.get("msg_id"), ""
+        )
+        if embedded_request_id != request_id:
+            conflicts.append("queued sibling embedded request_id mismatch")
+            continue
+        effect_error = _queued_request_effect_error(request, candidate)
+        if effect_error:
+            conflicts.append(effect_error)
+    if conflicts:
+        # Preserve fixed hashed/legacy artifact isolation on the rare conflict
+        # path without issuing redundant metadata probes before a normal QMT
+        # dispatch.  _isolate_artifact_paths performs its own guarded checks.
+        known = {
+            os.path.normcase(os.path.abspath(path)) for path in paths
+        }
+        for path in _queued_command_sibling_paths(request_id, current_path):
+            normalized = os.path.normcase(os.path.abspath(path))
+            if normalized not in known:
+                known.add(normalized)
+                paths.append(path)
+    return {
+        "conflict": "; ".join(sorted(set(conflicts))),
+        "paths": paths,
+    }
+
+
+def _fail_closed_queued_sibling_conflict(request, resolution):
+    global G_RECONCILE_NEEDED
+    request_id = _safe_str(request.get("request_id") or request.get("msg_id"), "")
+    paths = list(resolution.get("paths") or [])
+    paths.extend([
+        _response_path(request_id),
+        _legacy_response_path(request_id),
+        _request_guard_path(request_id),
+        _legacy_request_guard_path(request_id),
+    ])
+    _isolate_artifact_paths(paths)
+    response = _processing_recovery_unknown_response(
+        request,
+        {"state": "queued_sibling_conflict"},
+    )
+    response["queued_sibling_conflict"] = _safe_str(resolution.get("conflict"))
+    response["data"]["recovery_reason"] = "queued_sibling_conflict"
+    response["data"]["queued_sibling_conflict"] = response[
+        "queued_sibling_conflict"
+    ]
+    _write_request_guard(request_id, "unknown", request, response)
+    G_RECONCILE_NEEDED = True
+    G_METRICS["queued_sibling_conflict_total"] = (
+        G_METRICS.get("queued_sibling_conflict_total", 0) + 1
+    )
+    return response
+
+
+def _processing_recovery_unknown_response(request, guard):
+    request_id = _safe_str(request.get("request_id"), "")
+    action = _safe_str(request.get("action"), "")
+    guard_state = _safe_str((guard or {}).get("state"), "unknown")
+    return make_response(
+        True,
+        {
+            "status": "submit_unknown",
+            "stage": "SUBMIT_UNKNOWN",
+            "request_id": request_id,
+            "reconcile_required": True,
+            "recovery_reason": "processing_recovered_with_guard",
+            "recovery_guard_state": guard_state,
+        },
+        "",
+        "RECONCILE_REQUIRED",
+        request,
+        action,
+    )
+
+
+def _recover_processing_file(path, inbox_dir):
+    global G_RECONCILE_NEEDED
+    try:
+        request = _read_json(path)
+        if not isinstance(request, dict):
+            raise ValueError("processing request must be a JSON object")
+        request_id = _safe_str(request.get("request_id") or request.get("msg_id"), "")
+        if not request_id:
+            raise ValueError("processing request_id is required")
+        request["request_id"] = request_id
+    except Exception:
+        _move_file(path, FAILED_DIR)
+        return "failed"
+
+    action = _safe_str(request.get("action"), "")
+    if action not in ("place_order", "cancel_order"):
+        _return_processing_request(path, inbox_dir)
+        return "returned"
+
+    resolution = _resolve_request_artifacts(request)
+    if resolution.get("conflict"):
+        response = _fail_closed_artifact_conflict(request, resolution)
+        _write_response(request, response)
+        os.remove(path)
+        return "uncertain"
+
+    stable_response = resolution.get("response")
+    if stable_response is not None:
+        os.remove(path)
+        return "completed"
+
+    guard = resolution.get("guard")
+    if not isinstance(guard, dict):
+        _return_processing_request(path, inbox_dir)
+        return "returned"
+
+    guard_response = guard.get("response") if isinstance(guard, dict) else None
+    if isinstance(guard_response, dict) and guard_response:
+        recovered_response = dict(guard_response)
+        _write_response(request, recovered_response)
+        result = recovered_response.get("data") if isinstance(recovered_response.get("data"), dict) else {}
+        if result.get("status") == "submit_unknown":
+            G_RECONCILE_NEEDED = True
+        os.remove(path)
+        return "completed"
+
+    response = _processing_recovery_unknown_response(request, guard)
+    _write_request_guard(request_id, "unknown", request, response)
+    _write_response(request, response)
+    G_RECONCILE_NEEDED = True
+    os.remove(path)
+    return "uncertain"
+
+
+def _recover_processing_requests(max_files=MAX_PROCESSING_RECOVERY_FILES_PER_TICK):
+    global G_PROCESSING_RECOVERY_FOLDER_CURSOR
+    limit = max(1, _safe_int(max_files, MAX_PROCESSING_RECOVERY_FILES_PER_TICK))
+    folders = [
+        (PROCESSING_COMMANDS_DIR, INBOX_COMMANDS_DIR),
+        (PROCESSING_QUERIES_DIR, INBOX_QUERIES_DIR),
+    ]
+    start = G_PROCESSING_RECOVERY_FOLDER_CURSOR % len(folders)
+    ordered_folders = folders[start:] + folders[:start]
+    G_PROCESSING_RECOVERY_FOLDER_CURSOR = (start + 1) % len(folders)
+    processed = 0
+    for folder, inbox_dir in ordered_folders:
+        remaining = limit - processed
+        if remaining <= 0:
+            break
+        for path in _list_processing_recovery_files(folder, remaining):
+            try:
+                outcome = _recover_processing_file(path, inbox_dir)
+                key = "processing_recovery_%s_total" % outcome
+                G_METRICS[key] = G_METRICS.get(key, 0) + 1
+            except Exception as exc:
+                _set_last_error("processing recovery failed path=%s: %s" % (path, exc))
+                G_METRICS["processing_recovery_error_total"] = (
+                    G_METRICS.get("processing_recovery_error_total", 0) + 1
+                )
+            processed += 1
+            G_METRICS["processing_recovery_total"] = (
+                G_METRICS.get("processing_recovery_total", 0) + 1
+            )
+    return processed
 
 
 def _list_request_files(queue_kind="all", max_files=32):
@@ -943,33 +1966,74 @@ def _list_request_files(queue_kind="all", max_files=32):
         folders.append(INBOX_DIR)  # v1 compatibility queue
     files = []
     max_files = max(1, _safe_int(max_files, 32))
-    for folder in folders:
-        try:
-            entries = os.scandir(folder)
-        except Exception:
-            continue
-        try:
-            for entry in entries:
-                if entry.name.endswith(".json") and entry.is_file():
-                    files.append(entry.path)
-                    if len(files) >= max_files:
-                        break
-        finally:
+    scanned = 0
+    try:
+        for folder in folders:
+            entries = None
             try:
-                entries.close()
-            except Exception:
-                pass
-        if len(files) >= max_files:
-            break
-    files.sort()
-    return files
+                entries = os.scandir(folder)
+            except Exception as exc:
+                G_METRICS["request_queue_scan_unreadable_total"] = (
+                    G_METRICS.get("request_queue_scan_unreadable_total", 0) + 1
+                )
+                raise RuntimeError(
+                    "request queue directory unreadable folder=%s error=%s"
+                    % (folder, exc)
+                )
+            try:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > MAX_REQUEST_QUEUE_SCAN_ENTRIES_PER_CYCLE:
+                        G_METRICS["request_queue_scan_limit_exceeded_total"] = (
+                            G_METRICS.get(
+                                "request_queue_scan_limit_exceeded_total", 0
+                            )
+                            + 1
+                        )
+                        raise RuntimeError(
+                            "request queue scan limit exceeded limit=%d"
+                            % MAX_REQUEST_QUEUE_SCAN_ENTRIES_PER_CYCLE
+                        )
+                    if not entry.name.endswith(".json"):
+                        continue
+                    try:
+                        is_file = entry.is_file()
+                    except Exception as exc:
+                        G_METRICS["request_queue_scan_unreadable_total"] = (
+                            G_METRICS.get(
+                                "request_queue_scan_unreadable_total", 0
+                            )
+                            + 1
+                        )
+                        raise RuntimeError(
+                            "request queue entry unreadable path=%s error=%s"
+                            % (entry.path, exc)
+                        )
+                    if is_file:
+                        files.append(entry.path)
+            finally:
+                try:
+                    entries.close()
+                except Exception:
+                    pass
+    finally:
+        G_METRICS["request_queue_scanned_total"] = (
+            G_METRICS.get("request_queue_scanned_total", 0) + scanned
+        )
+        G_METRICS["request_queue_last_scanned"] = scanned
+    files.sort(
+        key=lambda path: (
+            os.path.basename(path),
+            os.path.normcase(os.path.abspath(path)),
+        )
+    )
+    return files[:max_files]
 
 
 def _guard_duplicate_response(request, request_id, action):
-    duplicate = _duplicate_response(request_id)
+    duplicate, guard = _duplicate_state(request)
     if duplicate is not None:
         return duplicate
-    guard = _read_request_guard(request_id)
     if not isinstance(guard, dict):
         return None
     state = _safe_str(guard.get("state"), "processing")
@@ -1001,11 +2065,25 @@ def _request_identity_error(request):
 
 def drain_file_requests(context, limit, queue_kind="all", budget_ms=0.0):
     global G_METRICS
+    recovered = _recover_processing_requests(MAX_PROCESSING_RECOVERY_FILES_PER_TICK)
+    if recovered >= MAX_PROCESSING_RECOVERY_FILES_PER_TICK:
+        G_METRICS["processing_recovery_saturated_total"] = (
+            G_METRICS.get("processing_recovery_saturated_total", 0) + 1
+        )
+        return 0
     cycle_started = time.perf_counter()
     processed = 0
     processing_dir = PROCESSING_COMMANDS_DIR if queue_kind == "command" else PROCESSING_QUERIES_DIR
     scan_limit = max(limit, min(64, limit * 4))
-    for path in _list_request_files(queue_kind, scan_limit):
+    try:
+        request_files = _list_request_files(queue_kind, scan_limit)
+    except Exception as exc:
+        _set_last_error("request queue scan failed closed: %s" % exc)
+        G_METRICS["request_queue_scan_failed_total"] = (
+            G_METRICS.get("request_queue_scan_failed_total", 0) + 1
+        )
+        return 0
+    for path in request_files:
         if processed >= limit:
             break
         if budget_ms and (time.perf_counter() - cycle_started) * 1000 >= budget_ms:
@@ -1030,7 +2108,17 @@ def drain_file_requests(context, limit, queue_kind="all", budget_ms=0.0):
             identity_error = _request_identity_error(request)
             duplicate = None
             if not identity_error and guarded_action:
-                duplicate = _guard_duplicate_response(request, request_id, action)
+                sibling_resolution = _preflight_command_siblings(
+                    request, processing_path
+                )
+                if sibling_resolution.get("conflict"):
+                    duplicate = _fail_closed_queued_sibling_conflict(
+                        request, sibling_resolution
+                    )
+                else:
+                    duplicate = _guard_duplicate_response(
+                        request, request_id, action
+                    )
             if identity_error:
                 response = make_response(
                     False,
@@ -1087,7 +2175,7 @@ def drain_file_requests(context, limit, queue_kind="all", budget_ms=0.0):
             G_METRICS["requests_failed"] += 1
             try:
                 if not request:
-                    request = {"request_id": os.path.splitext(os.path.basename(processing_path))[0], "_started_at": started}
+                    request = {"request_id": _make_request_id("invalid-request"), "_started_at": started}
                 if qmt_dispatched:
                     response = make_response(True, {
                         "status": "submit_unknown",
@@ -1474,22 +2562,181 @@ def _run_reconcile_cycle(ContextInfo, source):
     return 1
 
 
-def _cleanup_old_files(folder, cutoff, preserve_guards=False, max_delete=100):
+def _path_is_within_runtime(path):
+    try:
+        runtime = os.path.normcase(os.path.realpath(os.path.abspath(RUNTIME_DIR)))
+        candidate = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        return os.path.commonpath([runtime, candidate]) == runtime
+    except Exception:
+        return False
+
+
+def _is_callback_atomic_tmp_filename(filename):
+    if not filename.endswith(".tmp"):
+        return False
+    body = filename[:-4]
+    parts = body.rsplit(".", 1)
+    if len(parts) != 2 or not _is_ascii_digits(parts[1], 1, 10):
+        return False
+    target = parts[0]
+    if not target.endswith(".json"):
+        return False
+    event_parts = target[:-5].split("-")
+    return (
+        len(event_parts) == 3
+        and event_parts[0] == "evt"
+        and _is_ascii_digits(event_parts[1], 10, 20)
+        and _is_ascii_digits(event_parts[2], 6, 6)
+    )
+
+
+def _is_atomic_json_tmp_filename(filename, allow_callback=False):
+    if not filename.endswith(".tmp"):
+        return False
+    body = filename[:-4]
+    parts = body.rsplit(".", 2)
+    if (
+        len(parts) == 3
+        and len(parts[0]) > 5
+        and parts[0].endswith(".json")
+        and _is_ascii_digits(parts[1], 1, 10)
+        and _is_ascii_digits(parts[2], 10, 20)
+    ):
+        return True
+    return bool(allow_callback and _is_callback_atomic_tmp_filename(filename))
+
+
+def _cleanup_stale_atomic_tmp_files(
+    folder, cutoff, max_delete=32, max_scan=256, allow_callback=False
+):
     deleted = 0
     scanned = 0
-    max_scan = max(64, max_delete * 4)
+    max_delete = max(0, _safe_int(max_delete, 0))
+    max_scan = max(0, _safe_int(max_scan, 0))
+    if (
+        not max_delete
+        or not max_scan
+        or not _path_is_within_runtime(folder)
+    ):
+        return deleted, scanned
     entries = None
     try:
         entries = os.scandir(folder)
     except Exception:
-        return deleted
+        return deleted, scanned
     try:
         for entry in entries:
-            scanned += 1
-            if scanned > max_scan:
+            if scanned >= max_scan:
                 break
+            scanned += 1
+            if not _is_atomic_json_tmp_filename(entry.name, allow_callback):
+                continue
             try:
-                if not entry.is_file() or entry.stat().st_mtime >= cutoff:
+                if (
+                    not entry.is_file(follow_symlinks=False)
+                    or entry.stat(follow_symlinks=False).st_mtime >= cutoff
+                ):
+                    continue
+                os.remove(entry.path)
+                deleted += 1
+                if deleted >= max_delete:
+                    break
+            except Exception:
+                continue
+    finally:
+        try:
+            entries.close()
+        except Exception:
+            pass
+    return deleted, scanned
+
+
+def _run_stale_atomic_tmp_cleanup():
+    global G_STALE_TMP_CLEANUP_FOLDER_CURSOR
+    folders = [
+        RUNTIME_DIR,
+        INBOX_DIR,
+        INBOX_COMMANDS_DIR,
+        INBOX_QUERIES_DIR,
+        PROCESSING_DIR,
+        PROCESSING_COMMANDS_DIR,
+        PROCESSING_QUERIES_DIR,
+        RESPONSES_DIR,
+        REQUEST_STATE_DIR,
+        EVENTS_DIR,
+        EVENTS_LIVE_DIR,
+        EVENTS_FAILED_DIR,
+        SNAPSHOTS_DIR,
+        ARCHIVE_DIR,
+        DONE_DIR,
+        FAILED_DIR,
+    ]
+    start = G_STALE_TMP_CLEANUP_FOLDER_CURSOR % len(folders)
+    ordered_folders = folders[start:] + folders[:start]
+    G_STALE_TMP_CLEANUP_FOLDER_CURSOR = (start + 1) % len(folders)
+    remaining = max(1, MAX_STALE_ATOMIC_TMP_FILES_PER_TICK)
+    scan_remaining = max(1, MAX_STALE_ATOMIC_TMP_SCAN_ENTRIES_PER_TICK)
+    deleted = 0
+    scanned = 0
+    live_events = os.path.normcase(os.path.abspath(EVENTS_LIVE_DIR))
+    for folder in ordered_folders:
+        count, folder_scanned = _cleanup_stale_atomic_tmp_files(
+            folder,
+            _now() - STALE_ATOMIC_TMP_AGE_SECONDS,
+            remaining,
+            scan_remaining,
+            os.path.normcase(os.path.abspath(folder)) == live_events,
+        )
+        deleted += count
+        scanned += folder_scanned
+        remaining -= count
+        scan_remaining -= folder_scanned
+        if remaining <= 0 or scan_remaining <= 0:
+            break
+    G_METRICS["stale_tmp_cleanup_deleted_total"] = (
+        G_METRICS.get("stale_tmp_cleanup_deleted_total", 0) + deleted
+    )
+    G_METRICS["stale_tmp_cleanup_scanned_total"] = (
+        G_METRICS.get("stale_tmp_cleanup_scanned_total", 0) + scanned
+    )
+    G_METRICS["stale_tmp_cleanup_last_deleted"] = deleted
+    G_METRICS["stale_tmp_cleanup_last_scanned"] = scanned
+    G_METRICS["stale_tmp_cleanup_folder_cursor"] = (
+        G_STALE_TMP_CLEANUP_FOLDER_CURSOR
+    )
+    if scan_remaining <= 0:
+        G_METRICS["stale_tmp_cleanup_scan_budget_exhausted_total"] = (
+            G_METRICS.get(
+                "stale_tmp_cleanup_scan_budget_exhausted_total", 0
+            )
+            + 1
+        )
+    return deleted, scanned
+
+
+def _cleanup_old_files(folder, cutoff, preserve_guards=False, max_delete=100, max_scan=400):
+    deleted = 0
+    scanned = 0
+    max_delete = max(0, _safe_int(max_delete, 0))
+    max_scan = max(0, _safe_int(max_scan, 0))
+    if not max_delete or not max_scan:
+        return deleted, scanned
+    entries = None
+    try:
+        entries = os.scandir(folder)
+    except Exception:
+        return deleted, scanned
+    try:
+        for entry in entries:
+            if scanned >= max_scan:
+                break
+            scanned += 1
+            try:
+                if (
+                    not entry.name.endswith(".json")
+                    or not entry.is_file()
+                    or entry.stat().st_mtime >= cutoff
+                ):
                     continue
                 path = entry.path
                 if preserve_guards:
@@ -1507,11 +2754,11 @@ def _cleanup_old_files(folder, cutoff, preserve_guards=False, max_delete=100):
             entries.close()
         except Exception:
             pass
-    return deleted
+    return deleted, scanned
 
 
 def _run_maintenance_cycle(ContextInfo, source):
-    global G_CONTEXT, G_LAST_CALLBACK_SOURCE
+    global G_CONTEXT, G_LAST_CALLBACK_SOURCE, G_CLEANUP_FOLDER_CURSOR
     if _directory_has_json(INBOX_COMMANDS_DIR) or _directory_has_json(PROCESSING_COMMANDS_DIR):
         G_METRICS["maintenance_deferred_for_command_total"] = G_METRICS.get("maintenance_deferred_for_command_total", 0) + 1
         return 0
@@ -1522,20 +2769,47 @@ def _run_maintenance_cycle(ContextInfo, source):
     G_LAST_CALLBACK_SOURCE = source
     ensure_runtime_dirs()
     started = time.perf_counter()
+    _run_stale_atomic_tmp_cleanup()
     cutoff = _now() - MAX_FILE_AGE_SECONDS
     remaining = max(1, MAX_CLEANUP_FILES_PER_TICK)
+    scan_remaining = max(1, MAX_CLEANUP_SCAN_ENTRIES_PER_TICK)
     deleted = 0
-    for folder in (RESPONSES_DIR, EVENTS_LIVE_DIR, EVENTS_FAILED_DIR, DONE_DIR, FAILED_DIR):
-        count = _cleanup_old_files(folder, cutoff, False, remaining)
-        deleted += count
-        remaining -= count
-        if remaining <= 0:
-            break
-    if remaining > 0:
-        deleted += _cleanup_old_files(
-            REQUEST_STATE_DIR, _now() - REQUEST_GUARD_TTL_SECONDS, True, remaining,
+    scanned = 0
+    cleanup_folders = [
+        (EVENTS_FAILED_DIR, cutoff, False),
+        (DONE_DIR, cutoff, False),
+        (FAILED_DIR, cutoff, False),
+        (REQUEST_STATE_DIR, _now() - REQUEST_GUARD_TTL_SECONDS, True),
+    ]
+    start = G_CLEANUP_FOLDER_CURSOR % len(cleanup_folders)
+    ordered_folders = cleanup_folders[start:] + cleanup_folders[:start]
+    # Move the first folder every successful maintenance cycle. If one large
+    # directory consumes the full scan budget, the others still get priority
+    # on later cycles.
+    G_CLEANUP_FOLDER_CURSOR = (start + 1) % len(cleanup_folders)
+    for folder, folder_cutoff, preserve_guards in ordered_folders:
+        count, folder_scanned = _cleanup_old_files(
+            folder,
+            folder_cutoff,
+            preserve_guards,
+            remaining,
+            scan_remaining,
         )
+        deleted += count
+        scanned += folder_scanned
+        remaining -= count
+        scan_remaining -= folder_scanned
+        if remaining <= 0 or scan_remaining <= 0:
+            break
     G_METRICS["cleanup_deleted_total"] = G_METRICS.get("cleanup_deleted_total", 0) + deleted
+    G_METRICS["cleanup_scanned_total"] = G_METRICS.get("cleanup_scanned_total", 0) + scanned
+    G_METRICS["cleanup_last_deleted"] = deleted
+    G_METRICS["cleanup_last_scanned"] = scanned
+    G_METRICS["cleanup_folder_cursor"] = G_CLEANUP_FOLDER_CURSOR
+    if scan_remaining <= 0:
+        G_METRICS["cleanup_scan_budget_exhausted_total"] = (
+            G_METRICS.get("cleanup_scan_budget_exhausted_total", 0) + 1
+        )
     G_METRICS["cleanup_elapsed_ms"] = (time.perf_counter() - started) * 1000
     _safe_runtime_write("write_heartbeat", write_heartbeat, "running", 0)
     _safe_runtime_write("write_state", write_state, "running")
@@ -1549,6 +2823,7 @@ def init(ContextInfo):
     G_CONTEXT = ContextInfo
     G_ACCOUNT_READY = False
     ensure_runtime_dirs()
+    _recover_processing_requests(MAX_PROCESSING_RECOVERY_FILES_PER_TICK)
     _log("init account=%s type=%s runtime_dir=%s build=%s" % (ACCOUNT_ID, ACCOUNT_TYPE, RUNTIME_DIR, BUILD_ID))
     try:
         setter = getattr(ContextInfo, "set_account", None)

@@ -330,6 +330,7 @@ class BridgeClient:
         price: float,
         *,
         client_order_id: str,
+        request_id: str = "",
         price_type: int = 11,
         order_type: int = 0,
         strategy_name: str = "qmt_local_api",
@@ -369,10 +370,11 @@ class BridgeClient:
             23 if normalized_side == "BUY" else 24
         )
         msg_id = self.transport.new_msg_id()
+        normalized_request_id = str(request_id or "").strip()
         request = {
             "type": "NEW_ASYNC" if async_mode else "NEW",
             "msg_id": msg_id,
-            "request_id": msg_id,
+            "request_id": normalized_request_id or msg_id,
             "protocol_version": PROTOCOL_VERSION,
             "account_id": self.config.account_id,
             "account_name": self.config.account_name,
@@ -408,6 +410,7 @@ class BridgeClient:
         price: float,
         *,
         client_order_id: str,
+        request_id: str = "",
         price_type: int = 11,
         order_type: int = 0,
         strategy_name: str = "qmt_local_api",
@@ -428,6 +431,7 @@ class BridgeClient:
             quantity,
             price,
             client_order_id=client_order_id,
+            request_id=request_id,
             price_type=price_type,
             order_type=order_type,
             strategy_name=strategy_name,
@@ -453,21 +457,40 @@ class BridgeClient:
         order_id: str,
         *,
         async_mode: bool = False,
+        request_id: str = "",
     ) -> Dict[str, Any]:
         if not str(order_id).strip():
             raise ValueError("order_id is required")
-        return {
+        request = {
             "type": "CANCEL_ASYNC" if async_mode else "CANCEL",
             "account_id": self.config.account_id,
             "account_name": self.config.account_name,
             "order_id": str(order_id),
         }
+        normalized_request_id = str(request_id or "").strip()
+        if normalized_request_id:
+            request["request_id"] = normalized_request_id
+        return request
 
-    def send_cancel(self, order_id: str, *, async_mode: bool = False) -> str:
-        return self.send(self.build_cancel_request(order_id, async_mode=async_mode))
+    def send_cancel(
+        self,
+        order_id: str,
+        *,
+        async_mode: bool = False,
+        request_id: str = "",
+    ) -> str:
+        return self.send(self.build_cancel_request(
+            order_id,
+            async_mode=async_mode,
+            request_id=request_id,
+        ))
 
-    def send_cancel_async(self, order_id: str) -> str:
-        return self.send_cancel(order_id, async_mode=True)
+    def send_cancel_async(self, order_id: str, *, request_id: str = "") -> str:
+        return self.send_cancel(
+            order_id,
+            async_mode=True,
+            request_id=request_id,
+        )
 
     def build_cancel_sysid_request(
         self,
@@ -475,16 +498,21 @@ class BridgeClient:
         order_sysid: str,
         *,
         async_mode: bool = False,
+        request_id: str = "",
     ) -> Dict[str, Any]:
         if not str(order_sysid).strip():
             raise ValueError("order_sysid is required")
-        return {
+        request = {
             "type": "CANCEL_SYSID_ASYNC" if async_mode else "CANCEL_SYSID",
             "account_id": self.config.account_id,
             "account_name": self.config.account_name,
             "market": int(market),
             "order_sysid": str(order_sysid),
         }
+        normalized_request_id = str(request_id or "").strip()
+        if normalized_request_id:
+            request["request_id"] = normalized_request_id
+        return request
 
     def send_cancel_sysid(
         self,
@@ -492,17 +520,30 @@ class BridgeClient:
         order_sysid: str,
         *,
         async_mode: bool = False,
+        request_id: str = "",
     ) -> str:
         return self.send(
             self.build_cancel_sysid_request(
                 market,
                 order_sysid,
                 async_mode=async_mode,
+                request_id=request_id,
             )
         )
 
-    def send_cancel_sysid_async(self, market: int, order_sysid: str) -> str:
-        return self.send_cancel_sysid(market, order_sysid, async_mode=True)
+    def send_cancel_sysid_async(
+        self,
+        market: int,
+        order_sysid: str,
+        *,
+        request_id: str = "",
+    ) -> str:
+        return self.send_cancel_sysid(
+            market,
+            order_sysid,
+            async_mode=True,
+            request_id=request_id,
+        )
 
     def send_subscribe(self) -> str:
         return self.send({

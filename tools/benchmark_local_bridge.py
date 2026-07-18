@@ -3,8 +3,9 @@
 
 The runner deliberately does not start the TCP Gateway and never resolves a
 real QMT symbol.  It reuses the production ``FileQueueHelperClient`` and
-``drain_file_requests`` implementation inside a system TemporaryDirectory,
-with ``passorder`` replaced by an in-process probe.
+``drain_file_requests`` implementation plus the production SQLite WAL durable
+effect registry inside a system TemporaryDirectory, with ``passorder``
+replaced by an in-process probe.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CORE_CACHE: Optional[Tuple[Any, Any]] = None
 
@@ -174,14 +175,48 @@ def _payload(rng: random.Random, repeat: int, index: int, phase: str) -> Dict[st
     }
 
 
+def _gateway_enqueue_sequence(repeat: int, index: int, phase: str) -> int:
+    """Return a deterministic, positive and phase-ordered queue sequence."""
+    phase_rank = {
+        "warmup": 1,
+        "measured": 2,
+        "probe": 3,
+        "fault": 4,
+    }.get(phase, 9)
+    return (repeat + 1) * 100_000_000 + phase_rank * 10_000_000 + index + 1
+
+
+def _prepare_effect_payload(
+    gateway: Any,
+    payload: Dict[str, Any],
+    repeat: int,
+    index: int,
+    phase: str,
+) -> Dict[str, Any]:
+    """Attach the exact canonical identities used by the production Gateway."""
+    prepared = dict(payload)
+    prepared["gateway_enqueue_seq"] = _gateway_enqueue_sequence(
+        repeat, index, phase
+    )
+    prepared["intent_hash"] = gateway.BigQmtGatewayProxy.order_intent_key(
+        None, prepared
+    )
+    effect_kind, fingerprint = gateway.durable_effect_identity("order", prepared)
+    _require(effect_kind == "order", "production effect identity changed kind")
+    prepared["gateway_effect_fingerprint"] = fingerprint
+    return prepared
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise BenchmarkInvariantError(message)
 
 
 def _run_normal_sample(
+    gateway: Any,
     helper: Any,
     queue_client: Any,
+    effect_store: Any,
     payload: Dict[str, Any],
     repeat: int,
     index: int,
@@ -189,6 +224,38 @@ def _run_normal_sample(
     call_counts: Counter,
 ) -> Dict[str, Any]:
     request_id = str(payload["request_id"])
+    account_id = str(payload["account_id"])
+    intent_hash = gateway.BigQmtGatewayProxy.order_intent_key(None, payload)
+    effect_kind, fingerprint = gateway.durable_effect_identity("order", payload)
+    _require(payload.get("intent_hash") == intent_hash, "intent hash is not canonical")
+    _require(
+        payload.get("gateway_effect_fingerprint") == fingerprint,
+        "effect fingerprint is not canonical",
+    )
+
+    durable_started_ns = time.perf_counter_ns()
+    reserve_started_ns = durable_started_ns
+    prepared_record, reserve_duplicate = effect_store.reserve_effect_request(
+        account_id, request_id, effect_kind, fingerprint
+    )
+    reserved_ns = time.perf_counter_ns()
+    _require(not reserve_duplicate, "new effect request was reported as duplicate")
+    _require(prepared_record.get("state") == "PREPARED", "effect was not PREPARED")
+    _require(prepared_record.get("result") is None, "PREPARED effect has a result")
+
+    dispatch_started_ns = time.perf_counter_ns()
+    dispatched = effect_store.transition_effect_request(
+        account_id,
+        request_id,
+        fingerprint,
+        "DISPATCHING",
+        allowed_from=("PREPARED",),
+    )
+    dispatched_ns = time.perf_counter_ns()
+    _require(dispatched, "effect did not transition to DISPATCHING")
+
+    # These original timestamps intentionally surround only the file-queue
+    # path.  Registry overhead has separate metrics below.
     started_ns = time.perf_counter_ns()
     enqueue_result = queue_client.enqueue_action("place_order", payload, 1.0)
     enqueued_ns = time.perf_counter_ns()
@@ -221,6 +288,42 @@ def _run_normal_sample(
     queue_client.ack_response_sync(request_id)
     acked_ns = time.perf_counter_ns()
 
+    effect_result = {
+        "ok": True,
+        "request_id": request_id,
+        "stage": "BRIDGE_QUEUED",
+        "status": "accepted",
+    }
+    commit_started_ns = time.perf_counter_ns()
+    committed = effect_store.transition_effect_request(
+        account_id,
+        request_id,
+        fingerprint,
+        "ENQUEUED",
+        result=effect_result,
+        allowed_from=("DISPATCHING",),
+    )
+    committed_ns = time.perf_counter_ns()
+    _require(committed, "effect did not transition to ENQUEUED")
+    final_effect_record = effect_store.get_effect_request(account_id, request_id)
+    _require(isinstance(final_effect_record, dict), "final effect record is missing")
+
+    replay_started_ns = time.perf_counter_ns()
+    replay_record, replay_duplicate = effect_store.reserve_effect_request(
+        account_id, request_id, effect_kind, fingerprint
+    )
+    replayed_ns = time.perf_counter_ns()
+    effect_record_valid = bool(
+        final_effect_record.get("kind") == effect_kind
+        and final_effect_record.get("fingerprint") == fingerprint
+        and final_effect_record.get("state") == "ENQUEUED"
+        and final_effect_record.get("result") == effect_result
+        and replay_record.get("state") == "ENQUEUED"
+        and replay_record.get("result") == effect_result
+    )
+    _require(replay_duplicate, "effect registry replay was not deduplicated")
+    _require(effect_record_valid, "effect registry did not preserve state/result")
+
     return {
         "schema_version": SCHEMA_VERSION,
         "record_type": "sample",
@@ -229,6 +332,15 @@ def _run_normal_sample(
         "index": index,
         "request_id": request_id,
         "client_order_id": str(payload["client_order_id"]),
+        "intent_hash": intent_hash,
+        "gateway_effect_fingerprint": fingerprint,
+        "effect_kind": effect_kind,
+        "effect_state": str(final_effect_record.get("state") or ""),
+        "effect_result_stage": str(
+            (final_effect_record.get("result") or {}).get("stage") or ""
+        ),
+        "effect_registry_duplicate_replayed": replay_duplicate,
+        "effect_registry_record_valid": effect_record_valid,
         "symbol": str(payload["symbol"]),
         "side": str(payload["side"]),
         "quantity": int(payload["quantity"]),
@@ -242,6 +354,19 @@ def _run_normal_sample(
         "total_to_response_ms": (response_read_ns - started_ns) / 1_000_000.0,
         "queue_wait_ms": float(data.get("queue_wait_ms") or 0.0),
         "mock_passorder_elapsed_ms": float(data.get("passorder_elapsed_ms") or 0.0),
+        "effect_reserve_ms": (reserved_ns - reserve_started_ns) / 1_000_000.0,
+        "effect_dispatch_barrier_ms": (
+            dispatched_ns - dispatch_started_ns
+        ) / 1_000_000.0,
+        "effect_result_commit_ms": (
+            committed_ns - commit_started_ns
+        ) / 1_000_000.0,
+        "effect_replay_probe_ms": (
+            replayed_ns - replay_started_ns
+        ) / 1_000_000.0,
+        "durable_total_to_final_state_ms": (
+            committed_ns - durable_started_ns
+        ) / 1_000_000.0,
         "guard_probe_in_timed_sample": False,
         "final_guard_state": str(final_guard.get("state") or ""),
         "response_present_before_ack": response_present,
@@ -250,8 +375,10 @@ def _run_normal_sample(
 
 
 def _success_guard_probe(
+    gateway: Any,
     helper: Any,
     queue_client: Any,
+    effect_store: Any,
     repeat: int,
     seed: int,
 ) -> Dict[str, Any]:
@@ -262,6 +389,21 @@ def _success_guard_probe(
     payload["msg_id"] = request_id
     payload["trace_id"] = request_id
     payload["client_order_id"] = request_id
+    payload = _prepare_effect_payload(
+        gateway, payload, repeat, 9_999_998, "probe"
+    )
+    account_id = str(payload["account_id"])
+    effect_kind, fingerprint = gateway.durable_effect_identity("order", payload)
+    prepared_record, reserve_duplicate = effect_store.reserve_effect_request(
+        account_id, request_id, effect_kind, fingerprint
+    )
+    effect_dispatched = effect_store.transition_effect_request(
+        account_id,
+        request_id,
+        fingerprint,
+        "DISPATCHING",
+        allowed_from=("PREPARED",),
+    )
     calls = Counter()
     guard_visible = {"value": False}
 
@@ -284,6 +426,36 @@ def _success_guard_probe(
     response_present_before_ack = response_path.is_file()
     guard = helper._read_request_guard(request_id)
     response = queue_client.consume_response_sync(request_id)
+    effect_result = {
+        "ok": True,
+        "request_id": request_id,
+        "stage": "BRIDGE_QUEUED",
+        "status": "accepted",
+    }
+    effect_committed = effect_store.transition_effect_request(
+        account_id,
+        request_id,
+        fingerprint,
+        "ENQUEUED",
+        result=effect_result,
+        allowed_from=("DISPATCHING",),
+    )
+    final_effect_record = effect_store.get_effect_request(account_id, request_id)
+    replay_effect_record, effect_replay_duplicate = (
+        effect_store.reserve_effect_request(
+            account_id, request_id, effect_kind, fingerprint
+        )
+    )
+    conflicting_fingerprint = "sha256:" + ("0" * 64)
+    if conflicting_fingerprint == fingerprint:
+        conflicting_fingerprint = "sha256:" + ("1" * 64)
+    effect_conflict_rejected = False
+    try:
+        effect_store.reserve_effect_request(
+            account_id, request_id, effect_kind, conflicting_fingerprint
+        )
+    except gateway.IdempotencyConflict:
+        effect_conflict_rejected = True
     response_duplicate = queue_client.enqueue_action("place_order", payload, 1.0)
     calls_after_response_replay = calls[request_id]
     queue_client.ack_response_sync(request_id)
@@ -303,7 +475,24 @@ def _success_guard_probe(
         "response_replay_idempotent": bool(response_duplicate.get("idempotent")),
         "response_replay_call_count": calls_after_response_replay,
         "guard_replay_idempotent": bool(guard_duplicate.get("idempotent")),
+        "guard_replay_dedupe_layer": str(
+            guard_duplicate.get("dedupe_layer") or ""
+        ),
         "guard_replay_stage": str(guard_duplicate.get("duplicate_stage") or ""),
+        "intent_hash": str(payload.get("intent_hash") or ""),
+        "gateway_effect_fingerprint": fingerprint,
+        "effect_prepared": bool(
+            not reserve_duplicate and prepared_record.get("state") == "PREPARED"
+        ),
+        "effect_dispatched": effect_dispatched,
+        "effect_committed": effect_committed,
+        "effect_state": str((final_effect_record or {}).get("state") or ""),
+        "effect_result_stage": str(
+            ((final_effect_record or {}).get("result") or {}).get("stage") or ""
+        ),
+        "effect_replay_duplicate": effect_replay_duplicate,
+        "effect_replay_state": str(replay_effect_record.get("state") or ""),
+        "effect_conflict_rejected": effect_conflict_rejected,
     }
     checks["passed"] = bool(
         checks["first_drain_count"] == 1
@@ -316,14 +505,26 @@ def _success_guard_probe(
         and checks["response_replay_idempotent"]
         and checks["response_replay_call_count"] == 1
         and checks["guard_replay_idempotent"]
-        and checks["guard_replay_stage"] == "request_state"
+        and checks["guard_replay_dedupe_layer"] == "helper_guard"
+        and checks["intent_hash"].startswith("sha256:")
+        and checks["gateway_effect_fingerprint"].startswith("sha256:")
+        and checks["effect_prepared"]
+        and checks["effect_dispatched"]
+        and checks["effect_committed"]
+        and checks["effect_state"] == "ENQUEUED"
+        and checks["effect_result_stage"] == "BRIDGE_QUEUED"
+        and checks["effect_replay_duplicate"]
+        and checks["effect_replay_state"] == "ENQUEUED"
+        and checks["effect_conflict_rejected"]
     )
     return checks
 
 
 def _fault_injection(
+    gateway: Any,
     helper: Any,
     queue_client: Any,
+    effect_store: Any,
     repeat: int,
     seed: int,
 ) -> Dict[str, Any]:
@@ -333,6 +534,21 @@ def _fault_injection(
     payload["msg_id"] = request_id
     payload["trace_id"] = request_id
     payload["client_order_id"] = request_id
+    payload = _prepare_effect_payload(
+        gateway, payload, repeat, 9_999_999, "fault"
+    )
+    account_id = str(payload["account_id"])
+    effect_kind, fingerprint = gateway.durable_effect_identity("order", payload)
+    prepared_record, reserve_duplicate = effect_store.reserve_effect_request(
+        account_id, request_id, effect_kind, fingerprint
+    )
+    effect_dispatched = effect_store.transition_effect_request(
+        account_id,
+        request_id,
+        fingerprint,
+        "DISPATCHING",
+        allowed_from=("PREPARED",),
+    )
     calls = Counter()
     guard_visible = {"value": False}
 
@@ -355,6 +571,26 @@ def _fault_injection(
     response_present_before_ack = response_path.is_file()
     guard = helper._read_request_guard(request_id)
     response = queue_client.consume_response_sync(request_id)
+    effect_result = {
+        "ok": False,
+        "request_id": request_id,
+        "stage": "SUBMIT_UNKNOWN",
+        "status": "submit_unknown",
+    }
+    effect_committed = effect_store.transition_effect_request(
+        account_id,
+        request_id,
+        fingerprint,
+        "UNKNOWN",
+        result=effect_result,
+        allowed_from=("DISPATCHING",),
+    )
+    final_effect_record = effect_store.get_effect_request(account_id, request_id)
+    replay_effect_record, effect_replay_duplicate = (
+        effect_store.reserve_effect_request(
+            account_id, request_id, effect_kind, fingerprint
+        )
+    )
     replay = queue_client.enqueue_action("place_order", payload, 1.0)
     second_drain = helper.drain_file_requests(
         None, 1, "command", helper.COMMAND_BUDGET_MS
@@ -370,6 +606,19 @@ def _fault_injection(
         "response_present_before_ack": response_present_before_ack,
         "response_status": str(data.get("status") or ""),
         "replay_idempotent": bool(replay.get("idempotent")),
+        "intent_hash": str(payload.get("intent_hash") or ""),
+        "gateway_effect_fingerprint": fingerprint,
+        "effect_prepared": bool(
+            not reserve_duplicate and prepared_record.get("state") == "PREPARED"
+        ),
+        "effect_dispatched": effect_dispatched,
+        "effect_committed": effect_committed,
+        "effect_state": str((final_effect_record or {}).get("state") or ""),
+        "effect_result_stage": str(
+            ((final_effect_record or {}).get("result") or {}).get("stage") or ""
+        ),
+        "effect_replay_duplicate": effect_replay_duplicate,
+        "effect_replay_state": str(replay_effect_record.get("state") or ""),
     }
     checks["passed"] = bool(
         checks["first_drain_count"] == 1
@@ -380,6 +629,15 @@ def _fault_injection(
         and checks["response_present_before_ack"]
         and checks["response_status"] == "submit_unknown"
         and checks["replay_idempotent"]
+        and checks["intent_hash"].startswith("sha256:")
+        and checks["gateway_effect_fingerprint"].startswith("sha256:")
+        and checks["effect_prepared"]
+        and checks["effect_dispatched"]
+        and checks["effect_committed"]
+        and checks["effect_state"] == "UNKNOWN"
+        and checks["effect_result_stage"] == "SUBMIT_UNKNOWN"
+        and checks["effect_replay_duplicate"]
+        and checks["effect_replay_state"] == "UNKNOWN"
     )
     return checks
 
@@ -406,6 +664,11 @@ def _summarize(
         "total_to_response_ms",
         "queue_wait_ms",
         "mock_passorder_elapsed_ms",
+        "effect_reserve_ms",
+        "effect_dispatch_barrier_ms",
+        "effect_result_commit_ms",
+        "effect_replay_probe_ms",
+        "durable_total_to_final_state_ms",
     )
     metrics = {
         name: metric_summary(
@@ -425,6 +688,7 @@ def _summarize(
         and safety.get("success_guard_probe", {}).get("passed")
         and safety.get("guard_layer_duplicate_no_retry")
         and safety.get("fault_injection", {}).get("passed")
+        and safety.get("durable_effect_registry", {}).get("passed")
         and cleanup_verified
     )
     return {
@@ -479,11 +743,17 @@ def run_benchmark(
     measured_seconds = 0.0
     safety: Dict[str, Any] = {}
     last_queue_client: Any = None
+    last_effect_store: Any = None
+    effect_stores: List[Any] = []
 
     try:
         for repeat in range(repeats):
             repeat_root = temporary_path / ("repeat-%03d" % repeat)
             _bind_helper_root(helper, repeat_root)
+            effect_store = gateway.OrderCorrelationStore(
+                repeat_root / "benchmark_gateway_state.sqlite3"
+            )
+            effect_stores.append(effect_store)
             config = gateway.AccountConfig(
                 name="offline_bench",
                 account_id="OFFLINE_BENCH_ACCOUNT",
@@ -504,9 +774,14 @@ def run_benchmark(
             helper.call_passorder = mock_passorder
             for index in range(warmup):
                 warmup_payload = _payload(rng, repeat, index, "warmup")
+                warmup_payload = _prepare_effect_payload(
+                    gateway, warmup_payload, repeat, index, "warmup"
+                )
                 _run_normal_sample(
+                    gateway,
                     helper,
                     queue_client,
+                    effect_store,
                     warmup_payload,
                     repeat,
                     index,
@@ -517,10 +792,15 @@ def run_benchmark(
             repeat_started = time.perf_counter()
             for index in range(samples):
                 payload = _payload(rng, repeat, index, "measured")
+                payload = _prepare_effect_payload(
+                    gateway, payload, repeat, index, "measured"
+                )
                 try:
                     record = _run_normal_sample(
+                        gateway,
                         helper,
                         queue_client,
+                        effect_store,
                         payload,
                         repeat,
                         index,
@@ -536,30 +816,93 @@ def run_benchmark(
                         "index": index,
                         "request_id": str(payload.get("request_id") or ""),
                         "client_order_id": str(payload.get("client_order_id") or ""),
+                        "intent_hash": str(payload.get("intent_hash") or ""),
+                        "gateway_effect_fingerprint": str(
+                            payload.get("gateway_effect_fingerprint") or ""
+                        ),
                         "ok": False,
                         "error": "%s: %s" % (type(exc).__name__, exc),
                     }
                 records.append(record)
             measured_seconds += time.perf_counter() - repeat_started
             last_queue_client = queue_client
+            last_effect_store = effect_store
 
         _require(last_queue_client is not None, "benchmark created no queue client")
+        _require(last_effect_store is not None, "benchmark created no effect store")
         safety["success_guard_probe"] = _success_guard_probe(
-            helper, last_queue_client, repeats - 1, seed
+            gateway,
+            helper,
+            last_queue_client,
+            last_effect_store,
+            repeats - 1,
+            seed,
         )
         safety["guard_layer_duplicate_no_retry"] = bool(
             safety["success_guard_probe"].get("guard_replay_idempotent")
-            and safety["success_guard_probe"].get("guard_replay_stage")
-            == "request_state"
+            and safety["success_guard_probe"].get("guard_replay_dedupe_layer")
+            == "helper_guard"
             and safety["success_guard_probe"].get("second_drain_count") == 0
             and safety["success_guard_probe"].get("mock_passorder_calls") == 1
         )
         safety["guard_layer_replays_checked"] = 1
         safety["fault_injection"] = _fault_injection(
-            helper, last_queue_client, repeats - 1, seed
+            gateway,
+            helper,
+            last_queue_client,
+            last_effect_store,
+            repeats - 1,
+            seed,
         )
+        normal_registry_valid = bool(
+            len(records) == samples * repeats
+            and all(
+                record.get("ok")
+                and record.get("effect_kind") == "order"
+                and record.get("effect_state") == "ENQUEUED"
+                and record.get("effect_result_stage") == "BRIDGE_QUEUED"
+                and record.get("effect_registry_duplicate_replayed")
+                and record.get("effect_registry_record_valid")
+                for record in records
+            )
+        )
+        success_probe = safety["success_guard_probe"]
+        fault_probe = safety["fault_injection"]
+        durable_registry = {
+            "measured_records_checked": len(records),
+            "measured_records_valid": normal_registry_valid,
+            "success_state": str(success_probe.get("effect_state") or ""),
+            "success_result_stage": str(
+                success_probe.get("effect_result_stage") or ""
+            ),
+            "fault_state": str(fault_probe.get("effect_state") or ""),
+            "fault_result_stage": str(
+                fault_probe.get("effect_result_stage") or ""
+            ),
+            "exact_replays_deduplicated": bool(
+                success_probe.get("effect_replay_duplicate")
+                and fault_probe.get("effect_replay_duplicate")
+            ),
+            "conflict_rejected": bool(
+                success_probe.get("effect_conflict_rejected")
+            ),
+        }
+        durable_registry["passed"] = bool(
+            durable_registry["measured_records_valid"]
+            and durable_registry["success_state"] == "ENQUEUED"
+            and durable_registry["success_result_stage"] == "BRIDGE_QUEUED"
+            and durable_registry["fault_state"] == "UNKNOWN"
+            and durable_registry["fault_result_stage"] == "SUBMIT_UNKNOWN"
+            and durable_registry["exact_replays_deduplicated"]
+            and durable_registry["conflict_rejected"]
+        )
+        safety["durable_effect_registry"] = durable_registry
     finally:
-        temporary.cleanup()
+        try:
+            for effect_store in reversed(effect_stores):
+                effect_store.close()
+        finally:
+            temporary.cleanup()
 
     cleanup_verified = not temporary_path.exists()
     if not cleanup_verified:

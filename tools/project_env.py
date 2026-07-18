@@ -17,8 +17,8 @@ from typing import Any, Dict, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_FILE = ROOT / ".env"
-GATEWAY_BUILD_ID = "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io"
-HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
+GATEWAY_BUILD_ID = "xuanling_local_qmt_gateway_20260718_low_latency_v7_post_enqueue_barrier"
+HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v12_fail_closed_sibling_scan"
 PROTOCOL_VERSION = 2
 KEY_PATTERN = re.compile(r"^QMT_LOCAL_[A-Z0-9_]+$")
 LOCAL_DRIVE = re.compile(r"^[A-Za-z]:$")

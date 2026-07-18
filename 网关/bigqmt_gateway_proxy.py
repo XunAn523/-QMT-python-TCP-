@@ -28,21 +28,23 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
+from bounded_io import BoundedExecutorLane, IoLaneFull
 from order_correlation import (
     IdempotencyConflict,
     OrderCorrelationStore,
     WriterLease,
     qmt_correlation_value,
 )
+from windows_directory_watcher import WakeReason, WindowsDirectoryWatcher
 
 
 DEFAULT_MAX_FRAME_BYTES = 10 * 1024 * 1024
 DEFAULT_LOG_DIR = ""
 DEFAULT_RUNTIME_ROOT = ""
-PROXY_BUILD_ID = "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io"
-EXPECTED_LOCAL_HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
+PROXY_BUILD_ID = "xuanling_local_qmt_gateway_20260718_low_latency_v7_post_enqueue_barrier"
+EXPECTED_LOCAL_HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v12_fail_closed_sibling_scan"
 ORDER_INTENT_DEDUPE_SECONDS = 3.0
 ORDER_SIDE_INTENT_SECONDS = 6 * 60 * 60.0
 ORDER_CORRELATION_CACHE_MAX_KEYS = 60000
@@ -54,6 +56,13 @@ MAX_PENDING_RESPONSES_PER_ACCOUNT = 256
 MAX_RESPONSE_DELIVERY_TASKS_PER_ACCOUNT = 32
 MAX_RESPONSE_SCAN_ENTRIES_PER_TICK = 1024
 MAX_RESPONSE_FALLBACK_CHECKS_PER_TICK = 8
+MAX_COMMAND_QUEUE_DEPTH_PER_ACCOUNT = 256
+COMMAND_QUEUE_HIGH_WATER_PER_ACCOUNT = 224
+MAX_EXISTING_COMMAND_SCAN_ENTRIES_PER_DIRECTORY = 1024
+HELPER_HEALTH_SAMPLE_INTERVAL_SECONDS = 0.1
+HELPER_HEALTH_CACHE_MAX_AGE_SECONDS = 0.2
+FILE_IO_MAX_PENDING_PER_ACCOUNT = 192
+DB_IO_MAX_PENDING_PER_ACCOUNT = 256
 EFFECTFUL_DISPATCH_MESSAGE_TYPES = frozenset({
     "NEW",
     "NEW_ASYNC",
@@ -449,6 +458,71 @@ def safe_filename(value: Any) -> str:
     return name or make_request_id("file")
 
 
+def request_file_key(request_id: Any) -> str:
+    """Return a Windows-safe, collision-resistant key for request files.
+
+    Request IDs remain unchanged in the protocol and JSON payload.  Only the
+    on-disk filename is derived, so characters rejected by Windows and
+    case-insensitive names can never alias another request.
+    """
+    raw = safe_str(request_id, "").encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def command_request_filename(
+    request_id: Any,
+    payload: Optional[Dict[str, Any]] = None,
+) -> str:
+    sequence = safe_int((payload or {}).get("gateway_enqueue_seq"), 0)
+    key = request_file_key(request_id)
+    return ("%020d-%s.json" % (sequence, key)) if sequence > 0 else (key + ".json")
+
+
+def durable_effect_identity(
+    kind: str,
+    payload: Dict[str, Any],
+) -> tuple[str, str]:
+    """Canonical durable identity shared by live and migrated requests."""
+    normalized_kind = safe_str(kind).strip().lower()
+    if normalized_kind == "order":
+        effect_kind = "order"
+        canonical = {
+            key: value for key, value in (payload or {}).items()
+            if key not in {
+                "request_id", "msg_id", "trace_id", "created_at_ns",
+                "gateway_received_at_ns", "upstream_intent_hash",
+                "gateway_effect_fingerprint", "gateway_enqueue_seq",
+            }
+        }
+    else:
+        sysid = normalized_kind in {"cancel_sysid", "cancel_sysid_async"} or (
+            not safe_str((payload or {}).get("order_id")).strip()
+            and bool(safe_str((payload or {}).get("order_sysid")).strip())
+        )
+        effect_kind = "cancel_sysid" if sysid else "cancel_order"
+        canonical = {
+            "account_id": safe_str((payload or {}).get("account_id")).strip(),
+            "account_type": safe_str((payload or {}).get("account_type")).strip(),
+            "order_id": (
+                "" if sysid else safe_str((payload or {}).get("order_id")).strip()
+            ),
+            "order_sysid": (
+                first_nonempty_stripped(
+                    (payload or {}).get("order_sysid"),
+                    (payload or {}).get("order_id"),
+                )
+                if sysid
+                else safe_str((payload or {}).get("order_sysid")).strip()
+            ),
+            "market": (payload or {}).get("market", 0),
+        }
+    encoded = stable_hash({
+        "kind": effect_kind,
+        "effect": canonical,
+    }).encode("utf-8")
+    return effect_kind, "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def bounded_json_files(folder: Path, limit: int) -> List[Path]:
     result: List[Path] = []
     if limit <= 0:
@@ -472,18 +546,37 @@ def bounded_json_files(folder: Path, limit: int) -> List[Path]:
 def atomic_write_json(path: Path, payload: Dict[str, Any], ensure_parent: bool = True) -> None:
     if ensure_parent:
         path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name("%s.%s.%s.tmp" % (path.name, os.getpid(), int(now() * 1000000)))
-    with tmp.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(payload, f, ensure_ascii=False, sort_keys=True, default=json_default)
-        f.write("\n")
-    try:
-        os.replace(str(tmp), str(path))
-    except Exception:
+    for attempt in range(2):
+        tmp = path.with_name(
+            "%s.%s.%s.tmp" % (path.name, os.getpid(), time.time_ns())
+        )
         try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+            with tmp.open("w", encoding="utf-8", newline="\n") as f:
+                json.dump(
+                    payload,
+                    f,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=json_default,
+                )
+                f.write("\n")
+            os.replace(str(tmp), str(path))
+            return
+        except FileNotFoundError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            if attempt == 0:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                continue
+            raise
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
 
 def read_json_file(path: Path, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -661,6 +754,31 @@ class HelperTimeout(HelperError):
     pass
 
 
+class PostEnqueueResponseError(HelperError):
+    """A command was published before response observation failed.
+
+    This wrapper deliberately has a different code and type from the original
+    failure.  In particular, a post-publish ``IoLaneFull`` must never enter the
+    pre-enqueue rollback path and reopen the durable request id.
+    """
+
+    def __init__(self, action: str, request_id: str, cause: BaseException) -> None:
+        original_code = safe_str(getattr(cause, "code", "")).strip()
+        detail = safe_str(cause).strip() or type(cause).__name__
+        super().__init__(
+            "command was published before response polling failed: "
+            "action=%s request_id=%s error=%s%s"
+            % (
+                action,
+                request_id,
+                detail,
+                " original_code=%s" % original_code if original_code else "",
+            ),
+            "POST_ENQUEUE_RESPONSE_ERROR",
+        )
+        self.original_code = original_code
+
+
 class OutboundFrameTooLarge(ValueError):
     def __init__(self, actual_bytes: int, max_bytes: int) -> None:
         super().__init__(
@@ -672,7 +790,7 @@ class OutboundFrameTooLarge(ValueError):
 
 
 class FileQueueHelperClient:
-    def __init__(self, cfg: AccountConfig, logger: logging.Logger) -> None:
+    def __init__(self, cfg: AccountConfig, logger: logging.Logger, io_runner=None) -> None:
         self.cfg = cfg
         self.root = Path(cfg.runtime_dir)
         self.inbox = self.root / "inbox"
@@ -694,6 +812,7 @@ class FileQueueHelperClient:
         self.state_file = self.root / "state.json"
         self.readiness_file = self.root / "readiness.json"
         self.logger = logger
+        self._io_runner = io_runner or run_blocking
         self.last_error = ""
         self.last_success_at: Optional[float] = None
         self.last_failure_at: Optional[float] = None
@@ -721,7 +840,7 @@ class FileQueueHelperClient:
             path.mkdir(parents=True, exist_ok=True)
 
     async def health(self) -> Dict[str, Any]:
-        return await run_blocking(self.health_sync)
+        return await self._io_runner(self.health_sync)
 
     def health_sync(self) -> Dict[str, Any]:
         heartbeat = read_json_file(self.heartbeat_file)
@@ -764,6 +883,14 @@ class FileQueueHelperClient:
                 command_age_ms <= 250.0
                 and self.cfg.expected_command_interval_ms <= 0
             )
+        queue_read_error = ""
+        try:
+            command_queue_depth = self.command_queue_depth_sync(
+                MAX_COMMAND_QUEUE_DEPTH_PER_ACCOUNT + 1
+            )
+        except OSError as exc:
+            command_queue_depth = MAX_COMMAND_QUEUE_DEPTH_PER_ACCOUNT + 1
+            queue_read_error = "command queue is unreadable: %s" % exc
         ready = (
             alive
             and account_ready
@@ -772,6 +899,7 @@ class FileQueueHelperClient:
             and command_timer_ready
             and running_state == "running"
             and identity["identity_consistent"]
+            and not queue_read_error
         )
         data = {
             "ready": ready,
@@ -790,7 +918,10 @@ class FileQueueHelperClient:
             "last_command_cycle_age_ms": command_age_ms,
             "last_command_cycle_at": last_command_cycle_at,
             "readiness_age_ms": readiness_age_ms,
-            "last_error": safe_str(heartbeat.get("last_error") or state.get("last_error") or ""),
+            "last_error": (
+                queue_read_error
+                or safe_str(heartbeat.get("last_error") or state.get("last_error") or "")
+            ),
             "build_id": identity["build_id"],
             "protocol_version": identity["protocol_version"],
             "command_interval_ms": identity["command_interval_ms"],
@@ -799,6 +930,7 @@ class FileQueueHelperClient:
             "identity_missing": identity["identity_missing"],
             "identity_conflicts": identity["identity_conflicts"],
             "identity_consistent": identity["identity_consistent"],
+            "command_queue_depth": command_queue_depth,
         }
         if ready:
             self._record_success()
@@ -806,8 +938,128 @@ class FileQueueHelperClient:
             self._record_failure(data["last_error"] or data["state"])
         return data
 
+    def command_queue_depth_sync(self, limit: int) -> int:
+        """Return a bounded physical count of command and claimed files."""
+        maximum = max(1, int(limit))
+        count = 0
+        # ``inbox/*.json`` is the supported v1 queue layout.  It consumes the
+        # same QMT command capacity and therefore must participate in the
+        # physical high-water estimate alongside the v2 command directories.
+        for folder in (self.commands, self.processing_commands, self.inbox):
+            entries = None
+            try:
+                entries = os.scandir(str(folder))
+                for entry in entries:
+                    if entry.name.endswith(".json") and entry.is_file():
+                        count += 1
+                        if count >= maximum:
+                            return count
+            except OSError as exc:
+                raise OSError(
+                    "cannot scan command queue folder %s: %s" % (folder, exc)
+                ) from exc
+            finally:
+                if entries is not None:
+                    try:
+                        entries.close()
+                    except OSError:
+                        pass
+        return count
+
     def _response_path(self, request_id: str) -> Path:
+        return self.responses / (request_file_key(request_id) + ".json")
+
+    def _legacy_response_path(self, request_id: str) -> Path:
         return self.responses / (safe_filename(request_id) + ".json")
+
+    @staticmethod
+    def _json_request_id_matches(path: Path, request_id: str) -> bool:
+        """Fail closed when a legacy, non-injective filename is ambiguous."""
+        try:
+            data = read_json_file(path)
+        except Exception:
+            return False
+        return safe_str(data.get("request_id")).strip() == safe_str(request_id).strip()
+
+    def _migrate_legacy_request_path(
+        self,
+        legacy_path: Path,
+        hashed_path: Path,
+        request_id: str,
+    ) -> Optional[Path]:
+        if not legacy_path.is_file():
+            return None
+        if not self._json_request_id_matches(legacy_path, request_id):
+            self.logger.error(
+                "legacy_request_file_conflict path=%s request_id=%s",
+                legacy_path,
+                request_id,
+            )
+            return None
+        if hashed_path == legacy_path:
+            return legacy_path
+        if hashed_path.is_file():
+            return hashed_path
+        try:
+            os.replace(str(legacy_path), str(hashed_path))
+            return hashed_path
+        except OSError:
+            # The Helper may already hold the processing file open.  Reading
+            # the validated legacy path remains safe for this compatibility
+            # window; all new writes use the hashed name.
+            return legacy_path if legacy_path.is_file() else None
+
+    def _existing_response_path(
+        self,
+        request_id: str,
+        action: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        hashed = self._response_path(request_id)
+        legacy = self._legacy_response_path(request_id)
+        if hashed.is_file() and legacy.is_file():
+            if (
+                not self._json_request_id_matches(legacy, request_id)
+                or not self._request_artifacts_equal(hashed, legacy)
+            ):
+                raise HelperError(
+                    "hashed and legacy Helper responses conflict",
+                    "HELPER_RESPONSE_ARTIFACT_CONFLICT",
+                )
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+        result = hashed if hashed.is_file() else self._migrate_legacy_request_path(
+            legacy,
+            hashed,
+            request_id,
+        )
+        expected_payload = payload if isinstance(payload, dict) else {}
+        expected = safe_str(
+            expected_payload.get("gateway_effect_fingerprint")
+        ).strip()
+        if result is None or not expected:
+            return result
+        try:
+            response = read_json_file(result)
+        except Exception as exc:
+            raise HelperError(
+                "cannot validate existing Helper response: %s" % exc,
+                "INVALID_RESPONSE",
+            ) from exc
+        stored = safe_str(response.get("gateway_effect_fingerprint")).strip()
+        if stored != expected:
+            raise HelperError(
+                "existing Helper response belongs to a different or unverifiable effect",
+                "REQUEST_ID_CONFLICT",
+            )
+        if action and safe_str(response.get("action")).strip() != action:
+            raise HelperError(
+                "existing Helper response action does not match",
+                "REQUEST_ID_CONFLICT",
+            )
+        return result
 
     def _decode_existing_response_for_enqueue(self, request_id: str, response_path: Path) -> Dict[str, Any]:
         try:
@@ -821,32 +1073,422 @@ class FileQueueHelperClient:
                 "dedupe_layer": "helper_response",
                 "error": "invalid helper response: %s" % exc,
             }
+        return self._decode_existing_response_object_for_enqueue(
+            request_id,
+            response,
+            "helper_response",
+        )
+
+    def _decode_existing_response_object_for_enqueue(
+        self,
+        request_id: str,
+        response: Dict[str, Any],
+        dedupe_layer: str,
+    ) -> Dict[str, Any]:
         data = response.get("data")
         result = dict(data) if isinstance(data, dict) else {}
         result.setdefault("status", "done" if response.get("ok") is not False else "failed")
         result["queued"] = False
         result["request_id"] = request_id
         result["idempotent"] = True
-        result["dedupe_layer"] = "helper_response"
+        result["dedupe_layer"] = dedupe_layer
         if response.get("ok") is False and not result.get("error"):
             result["error"] = safe_str(response.get("error") or "helper request failed")
         self._record_success()
         return result
 
-    def _find_existing_request_file(self, request_id: str) -> tuple[Optional[Path], str]:
-        name = safe_filename(request_id) + ".json"
-        for stage, folder in (
+    @staticmethod
+    def _read_guard_response(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            guard = read_json_file(path)
+        except Exception:
+            return None
+        response = guard.get("response") if isinstance(guard, dict) else None
+        return dict(response) if isinstance(response, dict) else None
+
+    def _existing_request_matches_effect(
+        self,
+        path: Path,
+        request_id: str,
+        action: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        try:
+            data = read_json_file(path)
+        except Exception:
+            return False
+        if safe_str(data.get("request_id")).strip() != safe_str(request_id).strip():
+            return False
+        expected = safe_str(payload.get("gateway_effect_fingerprint")).strip()
+        if not expected:
+            return True
+        stored = first_nonempty_stripped(
+            data.get("gateway_effect_fingerprint"),
+            (data.get("payload") or {}).get("gateway_effect_fingerprint")
+            if isinstance(data.get("payload"), dict)
+            else "",
+        )
+        if stored:
+            return stored == expected
+        existing_action = safe_str(data.get("action")).strip()
+        existing_payload = (
+            data.get("payload") if isinstance(data.get("payload"), dict) else {}
+        )
+        if existing_action != action or not existing_payload:
+            # Old completed guards/responses lack enough information to prove
+            # equivalence.  Refusing them is safer than binding a new effect
+            # to an old request ID.
+            return False
+        if safe_str(data.get("account_id") or existing_payload.get("account_id")).strip() != self.cfg.account_id:
+            return False
+        if action == "place_order":
+            return (
+                safe_str(existing_payload.get("client_order_id")).strip()
+                == safe_str(payload.get("client_order_id")).strip()
+                and safe_str(existing_payload.get("intent_hash")).strip()
+                == safe_str(payload.get("intent_hash")).strip()
+            )
+        if action == "cancel_order":
+            return all(
+                safe_str(existing_payload.get(key)).strip()
+                == safe_str(payload.get(key)).strip()
+                for key in ("order_id", "order_sysid", "market")
+            )
+        return True
+
+    @staticmethod
+    def _request_artifacts_equal(first: Path, second: Path) -> bool:
+        try:
+            return stable_hash(read_json_file(first)) == stable_hash(
+                read_json_file(second)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ascii_digits(value: str, minimum: int, maximum: int) -> bool:
+        return (
+            minimum <= len(value) <= maximum
+            and value.isascii()
+            and value.isdigit()
+        )
+
+    @staticmethod
+    def _lower_hex(value: str, length: int) -> bool:
+        return len(value) == length and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    @staticmethod
+    def _regular_command_sibling_stem(stem: str, request_id: str) -> bool:
+        hashed = request_file_key(request_id)
+        legacy = safe_filename(request_id)
+        if stem in (hashed, legacy):
+            return True
+        return (
+            len(stem) == 85
+            and FileQueueHelperClient._ascii_digits(stem[:20], 20, 20)
+            and stem[20:21] == "-"
+            and stem[21:] == hashed
+        )
+
+    @classmethod
+    def _command_sibling_name_matches(cls, name: str, request_id: str) -> bool:
+        """Mirror Helper command, v1, and multi-recovered sibling names."""
+        if not name.endswith(".json"):
+            return False
+        stem = name[:-5]
+        while True:
+            if cls._regular_command_sibling_stem(stem, request_id):
+                return True
+            base, marker, suffix = stem.rpartition("-recovered-")
+            if not marker:
+                return False
+            parts = suffix.split("-")
+            if (
+                len(parts) != 2
+                or not cls._ascii_digits(parts[0], 10, 20)
+                or not cls._lower_hex(parts[1], 8)
+            ):
+                return False
+            stem = base
+
+    def _bounded_command_sibling_files(
+        self,
+        folder: Path,
+        request_id: str,
+    ) -> List[Path]:
+        """Return every known sibling or fail closed when absence is unknown."""
+        entries = None
+        result: List[Path] = []
+        try:
+            entries = os.scandir(str(folder))
+            scanned = 0
+            for entry in entries:
+                scanned += 1
+                if scanned > MAX_EXISTING_COMMAND_SCAN_ENTRIES_PER_DIRECTORY:
+                    raise HelperError(
+                        "bounded command scan cannot prove request absence: "
+                        "folder=%s limit=%s"
+                        % (
+                            folder,
+                            MAX_EXISTING_COMMAND_SCAN_ENTRIES_PER_DIRECTORY,
+                        ),
+                        "HELPER_QUEUE_SCAN_INCOMPLETE",
+                    )
+                if not self._command_sibling_name_matches(
+                    entry.name,
+                    request_id,
+                ):
+                    continue
+                if not entry.is_file():
+                    raise HelperError(
+                        "command sibling artifact is not a regular file: %s"
+                        % entry.path,
+                        "REQUEST_ID_CONFLICT",
+                    )
+                result.append(Path(entry.path))
+        except FileNotFoundError:
+            return []
+        except HelperError:
+            raise
+        except OSError as exc:
+            raise HelperError(
+                "cannot verify command sibling artifacts in %s: %s"
+                % (folder, exc),
+                "HELPER_QUEUE_STATE_UNAVAILABLE",
+            ) from exc
+        finally:
+            if entries is not None:
+                try:
+                    entries.close()
+                except OSError:
+                    pass
+        result.sort(key=lambda path: path.name)
+        return result
+
+    def _command_request_matches_effect(
+        self,
+        path: Path,
+        request_id: str,
+        action: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Require explicit request/action/fingerprint for every command sibling."""
+        try:
+            data = read_json_file(path)
+        except Exception:
+            return False
+        if safe_str(data.get("request_id")).strip() != safe_str(request_id).strip():
+            return False
+        if safe_str(data.get("action")).strip() != safe_str(action).strip():
+            return False
+        expected = safe_str(payload.get("gateway_effect_fingerprint")).strip()
+        stored = first_nonempty_stripped(
+            data.get("gateway_effect_fingerprint"),
+            (data.get("payload") or {}).get("gateway_effect_fingerprint")
+            if isinstance(data.get("payload"), dict)
+            else "",
+        )
+        return bool(expected and stored and stored == expected)
+
+    def _find_existing_command_request_file(
+        self,
+        request_id: str,
+        action: str,
+        payload: Dict[str, Any],
+    ) -> tuple[Optional[Path], str]:
+        """Validate every bounded command sibling before selecting one."""
+        hashed_name = request_file_key(request_id) + ".json"
+        legacy_name = safe_filename(request_id) + ".json"
+        matches: List[tuple[int, str, str, Path]] = []
+        stages = (
             ("commands", self.commands),
-            ("queries", self.queries),
             ("processing_commands", self.processing_commands),
-            ("processing_queries", self.processing_queries),
+            ("inbox_v1", self.inbox),
+        )
+        for stage_index, (stage, folder) in enumerate(stages):
+            candidates = self._bounded_command_sibling_files(
+                folder,
+                request_id,
+            )
+            candidates_by_name = {
+                candidate.name: candidate for candidate in candidates
+            }
+            hashed_candidate = candidates_by_name.get(hashed_name)
+            legacy_candidate = candidates_by_name.get(legacy_name)
+            if (
+                hashed_name != legacy_name
+                and hashed_candidate is not None
+                and legacy_candidate is not None
+                and not self._request_artifacts_equal(
+                    hashed_candidate,
+                    legacy_candidate,
+                )
+            ):
+                raise HelperError(
+                    "hashed and legacy request artifacts conflict",
+                    "REQUEST_ID_CONFLICT",
+                )
+            for candidate in candidates:
+                if not self._command_request_matches_effect(
+                    candidate,
+                    request_id,
+                    action,
+                    payload,
+                ):
+                    raise HelperError(
+                        "command sibling belongs to a different or "
+                        "unverifiable effect",
+                        "REQUEST_ID_CONFLICT",
+                    )
+                matches.append((stage_index, stage, candidate.name, candidate))
+        if not matches:
+            return None, ""
+        migrated_matches: List[tuple[int, str, str, Path]] = []
+        for stage_index, stage, _name, candidate in matches:
+            if candidate.name == legacy_name and candidate.name != hashed_name:
+                migrated = self._migrate_legacy_request_path(
+                    candidate,
+                    candidate.parent / hashed_name,
+                    request_id,
+                )
+                if migrated is not None:
+                    candidate = migrated
+            migrated_matches.append(
+                (stage_index, stage, candidate.name, candidate)
+            )
+        matches = list(dict.fromkeys(migrated_matches))
+        matches.sort(key=lambda item: (item[0], item[2], str(item[3])))
+        selected = matches[0]
+        return selected[3], selected[1]
+
+    def _find_existing_request_file(
+        self,
+        request_id: str,
+        action: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[Path], str]:
+        expected_payload = payload if isinstance(payload, dict) else {}
+        if action in ("place_order", "cancel_order"):
+            command_path, command_stage = (
+                self._find_existing_command_request_file(
+                    request_id,
+                    action,
+                    expected_payload,
+                )
+            )
+            if command_path is not None:
+                return command_path, command_stage
+        hashed_name = request_file_key(request_id) + ".json"
+        legacy_name = safe_filename(request_id) + ".json"
+        exact_probe_stages = (
+            (
+                ("queries", self.queries),
+                ("processing_queries", self.processing_queries),
+            )
+            if action in ("place_order", "cancel_order")
+            else (
+                ("commands", self.commands),
+                ("queries", self.queries),
+                ("processing_commands", self.processing_commands),
+                ("processing_queries", self.processing_queries),
+            )
+        )
+        for stage, folder in exact_probe_stages:
+            hashed = folder / hashed_name
+            if hashed.is_file():
+                if not self._existing_request_matches_effect(
+                    hashed, request_id, action, expected_payload,
+                ):
+                    raise HelperError(
+                        "existing request file belongs to a different effect",
+                        "REQUEST_ID_CONFLICT",
+                    )
+                legacy_sibling = folder / legacy_name
+                if legacy_sibling.is_file():
+                    if (
+                        not self._existing_request_matches_effect(
+                            legacy_sibling,
+                            request_id,
+                            action,
+                            expected_payload,
+                        )
+                        or not self._request_artifacts_equal(
+                            hashed,
+                            legacy_sibling,
+                        )
+                    ):
+                        raise HelperError(
+                            "hashed and legacy request artifacts conflict",
+                            "REQUEST_ID_CONFLICT",
+                        )
+                    try:
+                        legacy_sibling.unlink()
+                    except OSError:
+                        pass
+                return hashed, stage
+            legacy_path = folder / legacy_name
+            if legacy_path.is_file() and not self._existing_request_matches_effect(
+                legacy_path, request_id, action, expected_payload,
+            ):
+                raise HelperError(
+                    "legacy request file belongs to a different effect",
+                    "REQUEST_ID_CONFLICT",
+                )
+            migrated = self._migrate_legacy_request_path(
+                legacy_path,
+                hashed,
+                request_id,
+            )
+            if migrated is not None:
+                return migrated, stage
+        hashed_guard = self.request_state / hashed_name
+        legacy_guard = self.request_state / legacy_name
+        if hashed_guard.is_file():
+            if not self._existing_request_matches_effect(
+                hashed_guard, request_id, action, expected_payload,
+            ):
+                raise HelperError(
+                    "existing Helper guard cannot prove the same effect",
+                    "REQUEST_ID_CONFLICT",
+                )
+            if legacy_guard.is_file():
+                if (
+                    not self._existing_request_matches_effect(
+                        legacy_guard,
+                        request_id,
+                        action,
+                        expected_payload,
+                    )
+                    or not self._request_artifacts_equal(
+                        hashed_guard,
+                        legacy_guard,
+                    )
+                ):
+                    raise HelperError(
+                        "hashed and legacy Helper guards conflict",
+                        "REQUEST_ID_CONFLICT",
+                    )
+                try:
+                    legacy_guard.unlink()
+                except OSError:
+                    pass
+            return hashed_guard, "request_state"
+        if legacy_guard.is_file() and not self._existing_request_matches_effect(
+            legacy_guard, request_id, action, expected_payload,
         ):
-            path = folder / name
-            if path.exists():
-                return path, stage
-        guard = self.request_state / name
-        if guard.exists():
-            return guard, "request_state"
+            raise HelperError(
+                "legacy Helper guard cannot prove the same effect",
+                "REQUEST_ID_CONFLICT",
+            )
+        migrated_guard = self._migrate_legacy_request_path(
+            legacy_guard,
+            hashed_guard,
+            request_id,
+        )
+        if migrated_guard is not None:
+            return migrated_guard, "request_state"
         return None, ""
 
     async def request(
@@ -855,28 +1497,59 @@ class FileQueueHelperClient:
         payload: Dict[str, Any],
         timeout: float,
         timeout_as_queued: bool = False,
+        enqueue_done: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
-        request_id, immediate = await run_blocking(
-            self._prepare_request_sync,
-            action,
-            payload or {},
-            timeout,
-        )
+        try:
+            request_id, immediate = await self._io_runner(
+                self._prepare_request_sync,
+                action,
+                payload or {},
+                timeout,
+            )
+        finally:
+            if enqueue_done is not None:
+                enqueue_done()
         if immediate is not None:
             return immediate
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.01, timeout)
-        while loop.time() < deadline:
-            ready, response = await run_blocking(
-                self._read_response_if_ready_sync,
-                request_id,
-            )
-            if ready:
-                return response
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(0.02, remaining))
+        try:
+            while loop.time() < deadline:
+                try:
+                    ready, response = await self._io_runner(
+                        self._read_response_if_ready_sync,
+                        request_id,
+                        action,
+                        payload or {},
+                    )
+                except IoLaneFull:
+                    if action not in ("place_order", "cancel_order"):
+                        raise
+                    # The command is already published.  File-lane pressure is
+                    # transient observation backpressure, not evidence of a
+                    # failed trading effect.  Retry boundedly within the
+                    # original response deadline; the normal queued-timeout
+                    # result remains the terminal fallback.
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.005, remaining))
+                    continue
+                if ready:
+                    return response
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.02, remaining))
+        except asyncio.CancelledError:
+            # The durable DISPATCHING barrier remains fail-closed.  The caller
+            # must never interpret cancellation after publication as proof
+            # that no command exists.
+            raise
+        except Exception as exc:
+            if action in ("place_order", "cancel_order"):
+                raise PostEnqueueResponseError(action, request_id, exc) from exc
+            raise
         return self._request_timeout_result(
             action,
             request_id,
@@ -897,23 +1570,41 @@ class FileQueueHelperClient:
         ) or make_request_id(action)
         payload = dict(payload)
         payload["request_id"] = request_id
-        response_path = self._response_path(request_id)
-        if response_path.exists():
+        response_path = self._existing_response_path(request_id, action, payload)
+        if response_path is not None:
             return request_id, self._decode_response(response_path)
         request = self._build_request(action, payload, request_id, timeout)
-        existing_path, _ = self._find_existing_request_file(request_id)
+        existing_path, existing_stage = self._find_existing_request_file(
+            request_id,
+            action,
+            payload,
+        )
+        if existing_path and existing_stage == "request_state":
+            guard_response = self._read_guard_response(existing_path)
+            if guard_response is not None:
+                return request_id, self._decode_response_object(
+                    guard_response,
+                    "helper guard %s" % existing_path,
+                )
         if not existing_path:
             queue_dir = self.commands if action in ("place_order", "cancel_order") else self.queries
-            request_path = queue_dir / (safe_filename(request_id) + ".json")
+            request_name = (
+                command_request_filename(request_id, payload)
+                if queue_dir == self.commands
+                else request_file_key(request_id) + ".json"
+            )
+            request_path = queue_dir / request_name
             atomic_write_json(request_path, request)
         return request_id, None
 
     def _read_response_if_ready_sync(
         self,
         request_id: str,
+        action: str,
+        payload: Dict[str, Any],
     ) -> tuple[bool, Dict[str, Any]]:
-        response_path = self._response_path(request_id)
-        if not response_path.exists():
+        response_path = self._existing_response_path(request_id, action, payload)
+        if response_path is None:
             return False, {}
         return True, self._decode_response(response_path)
 
@@ -942,11 +1633,28 @@ class FileQueueHelperClient:
         ) or make_request_id(action)
         payload = dict(payload)
         payload["request_id"] = request_id
-        response_path = self._response_path(request_id)
-        if response_path.exists():
+        response_path = self._existing_response_path(request_id, action, payload)
+        if response_path is not None:
             return self._decode_existing_response_for_enqueue(request_id, response_path)
-        existing_path, existing_stage = self._find_existing_request_file(request_id)
+        existing_path, existing_stage = self._find_existing_request_file(
+            request_id,
+            action,
+            payload,
+        )
         if existing_path:
+            if existing_stage == "request_state":
+                guard_response = self._read_guard_response(existing_path)
+                if guard_response is not None:
+                    atomic_write_json(
+                        self._response_path(request_id),
+                        guard_response,
+                        ensure_parent=False,
+                    )
+                    return self._decode_existing_response_object_for_enqueue(
+                        request_id,
+                        guard_response,
+                        "helper_guard",
+                    )
             return {
                 "status": "queued",
                 "queued": True,
@@ -957,7 +1665,7 @@ class FileQueueHelperClient:
                 "duplicate_stage": existing_stage,
             }
         request = self._build_request(action, payload, request_id, timeout)
-        path = self.commands / (safe_filename(request_id) + ".json")
+        path = self.commands / command_request_filename(request_id, payload)
         atomic_write_json(path, request, ensure_parent=False)
         return {
             "status": "queued",
@@ -982,19 +1690,36 @@ class FileQueueHelperClient:
         ) or make_request_id(action)
         payload = dict(payload)
         payload["request_id"] = request_id
-        response_path = self._response_path(request_id)
-        if response_path.exists():
+        response_path = self._existing_response_path(request_id, action, payload)
+        if response_path is not None:
             return self._decode_response(response_path)
         request = self._build_request(action, payload, request_id, timeout)
-        existing_path, _ = self._find_existing_request_file(request_id)
+        existing_path, existing_stage = self._find_existing_request_file(
+            request_id,
+            action,
+            payload,
+        )
+        if existing_path and existing_stage == "request_state":
+            guard_response = self._read_guard_response(existing_path)
+            if guard_response is not None:
+                return self._decode_response_object(
+                    guard_response,
+                    "helper guard %s" % existing_path,
+                )
         if not existing_path:
             queue_dir = self.commands if action in ("place_order", "cancel_order") else self.queries
-            request_path = queue_dir / (safe_filename(request_id) + ".json")
+            request_name = (
+                command_request_filename(request_id, payload)
+                if queue_dir == self.commands
+                else request_file_key(request_id) + ".json"
+            )
+            request_path = queue_dir / request_name
             atomic_write_json(request_path, request)
         deadline = time.monotonic() + max(0.01, timeout)
         while time.monotonic() < deadline:
-            if response_path.exists():
-                return self._decode_response(response_path)
+            ready_path = self._existing_response_path(request_id, action, payload)
+            if ready_path is not None:
+                return self._decode_response(ready_path)
             time.sleep(0.02)
         return self._request_timeout_result(action, request_id, timeout_as_queued)
 
@@ -1007,6 +1732,9 @@ class FileQueueHelperClient:
             "account_id": self.cfg.account_id,
             "account_type": self.cfg.account_type,
             "action": action,
+            "gateway_effect_fingerprint": safe_str(
+                payload.get("gateway_effect_fingerprint")
+            ),
             "payload": payload,
             "created_at": created,
             "deadline_at": created + timeout if timeout else 0,
@@ -1021,30 +1749,34 @@ class FileQueueHelperClient:
             message = "invalid helper response %s: %s" % (response_path, exc)
             self._record_failure(message)
             raise HelperError(message, "INVALID_RESPONSE") from exc
-        if response.get("ok") is False:
-            message = safe_str(response.get("error") or response.get("message") or "helper request failed")
-            code = safe_str(response.get("code") or "HELPER_ERROR")
-            self._record_failure(message)
+        try:
+            return self._decode_response_object(response, str(response_path))
+        finally:
             try:
                 response_path.unlink()
             except OSError:
                 pass
+
+    def _decode_response_object(
+        self,
+        response: Dict[str, Any],
+        source: str,
+    ) -> Dict[str, Any]:
+        if response.get("ok") is False:
+            message = safe_str(response.get("error") or response.get("message") or "helper request failed")
+            code = safe_str(response.get("code") or "HELPER_ERROR")
+            self._record_failure(message)
             raise HelperError(message, code)
         self._record_success()
         data = response.get("data")
-        result = data if isinstance(data, dict) else {"value": data}
-        try:
-            response_path.unlink()
-        except OSError:
-            pass
-        return result
+        return data if isinstance(data, dict) else {"value": data, "source": source}
 
     async def consume_response(self, request_id: str) -> Dict[str, Any]:
-        return await run_blocking(self.consume_response_sync, request_id)
+        return await self._io_runner(self.consume_response_sync, request_id)
 
     def consume_response_sync(self, request_id: str) -> Dict[str, Any]:
-        path = self._response_path(request_id)
-        if not path.exists():
+        path = self._existing_response_path(request_id)
+        if path is None:
             return {}
         return read_json_file(path)
 
@@ -1054,7 +1786,7 @@ class FileQueueHelperClient:
         max_entries: int,
         max_responses: int,
     ) -> tuple[Dict[str, Dict[str, Any]], Set[str], bool]:
-        return await run_blocking(
+        return await self._io_runner(
             self.read_available_responses_sync,
             request_ids,
             max_entries,
@@ -1071,10 +1803,18 @@ class FileQueueHelperClient:
         entry_limit = max(1, int(max_entries))
         response_limit = max(1, int(max_responses))
         filename_to_request_id = {
-            safe_filename(request_id) + ".json": request_id
+            request_file_key(request_id) + ".json": request_id
             for request_id in request_ids
             if request_id
         }
+        legacy_filename_candidates: Dict[str, Set[str]] = {}
+        for request_id in request_ids:
+            if not request_id:
+                continue
+            legacy_filename_candidates.setdefault(
+                safe_filename(request_id) + ".json",
+                set(),
+            ).add(request_id)
         if not filename_to_request_id:
             return {}, set(), True
         entries = None
@@ -1090,9 +1830,9 @@ class FileQueueHelperClient:
                     scan_complete = False
                     break
                 request_id = filename_to_request_id.get(entry.name)
-                if not request_id or not entry.is_file():
+                legacy_candidates = legacy_filename_candidates.get(entry.name, set())
+                if (not request_id and not legacy_candidates) or not entry.is_file():
                     continue
-                observed_request_ids.add(request_id)
                 try:
                     response = read_json_file(Path(entry.path))
                 except Exception as exc:
@@ -1102,11 +1842,40 @@ class FileQueueHelperClient:
                         exc,
                     )
                     continue
-                if response:
-                    responses[request_id] = response
-                if len(responses) >= response_limit:
-                    scan_complete = False
-                    break
+                if not response:
+                    continue
+                if not request_id:
+                    embedded_request_id = safe_str(response.get("request_id")).strip()
+                    if embedded_request_id not in legacy_candidates:
+                        self.logger.error(
+                            "legacy_response_file_conflict path=%s embedded_request_id=%s",
+                            entry.path,
+                            embedded_request_id,
+                        )
+                        continue
+                    request_id = embedded_request_id
+                existing_response = responses.get(request_id)
+                if existing_response is None and len(responses) >= response_limit:
+                    continue
+                if (
+                    existing_response is not None
+                    and stable_hash(existing_response) != stable_hash(response)
+                ):
+                    response = {
+                        "version": 1,
+                        "ok": False,
+                        "request_id": request_id,
+                        "data": {
+                            "status": "submit_unknown",
+                            "stage": "SUBMIT_UNKNOWN",
+                        },
+                        "code": "HELPER_RESPONSE_ARTIFACT_CONFLICT",
+                        "error": (
+                            "hashed and legacy Helper responses conflict; reconcile before retry"
+                        ),
+                    }
+                observed_request_ids.add(request_id)
+                responses[request_id] = response
         except FileNotFoundError:
             return {}, set(), True
         finally:
@@ -1121,7 +1890,7 @@ class FileQueueHelperClient:
         self,
         request_ids: Set[str],
     ) -> tuple[Dict[str, Dict[str, Any]], Set[str]]:
-        return await run_blocking(self.read_targeted_responses_sync, request_ids)
+        return await self._io_runner(self.read_targeted_responses_sync, request_ids)
 
     def read_targeted_responses_sync(
         self,
@@ -1133,10 +1902,24 @@ class FileQueueHelperClient:
         for request_id in request_ids:
             if not request_id:
                 continue
-            response_path = self._response_path(request_id)
-            if not response_path.is_file():
+            try:
+                response_path = self._existing_response_path(request_id)
+            except HelperError as exc:
+                responses[request_id] = {
+                    "version": 1,
+                    "ok": False,
+                    "request_id": request_id,
+                    "data": {
+                        "status": "submit_unknown",
+                        "stage": "SUBMIT_UNKNOWN",
+                    },
+                    "code": exc.code,
+                    "error": safe_str(exc),
+                }
+                observed_request_ids.add(request_id)
                 continue
-            observed_request_ids.add(request_id)
+            if response_path is None:
+                continue
             try:
                 response = read_json_file(response_path)
             except Exception as exc:
@@ -1146,19 +1929,28 @@ class FileQueueHelperClient:
                     exc,
                 )
                 continue
-            if response:
-                responses[request_id] = response
+            if not response:
+                continue
+            observed_request_ids.add(request_id)
+            responses[request_id] = response
         return responses, observed_request_ids
 
     async def ack_response(self, request_id: str) -> None:
-        await run_blocking(self.ack_response_sync, request_id)
+        await self._io_runner(self.ack_response_sync, request_id)
 
     def ack_response_sync(self, request_id: str) -> None:
-        path = self._response_path(request_id)
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        for path in {
+            self._response_path(request_id),
+            self._legacy_response_path(request_id),
+        }:
+            try:
+                if path.is_file() and (
+                    path == self._response_path(request_id)
+                    or self._json_request_id_matches(path, request_id)
+                ):
+                    path.unlink()
+            except OSError:
+                pass
 
     async def snapshot(self) -> Dict[str, Any]:
         return await self.request("snapshot", {}, self.cfg.query_timeout_seconds)
@@ -1178,34 +1970,64 @@ class FileQueueHelperClient:
     async def order_status(self, order_id: str) -> Dict[str, Any]:
         return await self.request("order_status", {"order_id": order_id}, self.cfg.query_timeout_seconds)
 
-    async def place_order(self, payload: Dict[str, Any], wait: bool) -> Dict[str, Any]:
+    async def place_order(
+        self,
+        payload: Dict[str, Any],
+        wait: bool,
+        enqueue_done: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         if not wait:
-            return await run_blocking(
-                self.enqueue_action,
-                "place_order",
-                payload,
-                self.cfg.trade_enqueue_timeout_seconds,
-            )
-        return await self.request("place_order", payload, self.cfg.request_timeout_seconds, timeout_as_queued=True)
+            try:
+                return await self._io_runner(
+                    self.enqueue_action,
+                    "place_order",
+                    payload,
+                    self.cfg.trade_enqueue_timeout_seconds,
+                )
+            finally:
+                if enqueue_done is not None:
+                    enqueue_done()
+        return await self.request(
+            "place_order",
+            payload,
+            self.cfg.request_timeout_seconds,
+            timeout_as_queued=True,
+            enqueue_done=enqueue_done,
+        )
 
-    async def cancel_order(self, payload: Dict[str, Any], wait: bool) -> Dict[str, Any]:
+    async def cancel_order(
+        self,
+        payload: Dict[str, Any],
+        wait: bool,
+        enqueue_done: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         if not wait:
-            return await run_blocking(
-                self.enqueue_action,
-                "cancel_order",
-                payload,
-                self.cfg.trade_enqueue_timeout_seconds,
-            )
-        return await self.request("cancel_order", payload, self.cfg.request_timeout_seconds, timeout_as_queued=True)
+            try:
+                return await self._io_runner(
+                    self.enqueue_action,
+                    "cancel_order",
+                    payload,
+                    self.cfg.trade_enqueue_timeout_seconds,
+                )
+            finally:
+                if enqueue_done is not None:
+                    enqueue_done()
+        return await self.request(
+            "cancel_order",
+            payload,
+            self.cfg.request_timeout_seconds,
+            timeout_as_queued=True,
+            enqueue_done=enqueue_done,
+        )
 
     async def generic_action(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return await self.request(action, payload, self.cfg.request_timeout_seconds)
 
     async def latest_snapshot(self) -> Dict[str, Any]:
-        return await run_blocking(lambda: read_json_file(self.snapshots / "latest.json"))
+        return await self._io_runner(lambda: read_json_file(self.snapshots / "latest.json"))
 
     async def read_events(self, max_batch: int = 100) -> List[Dict[str, Any]]:
-        return await run_blocking(self.read_events_sync, max_batch)
+        return await self._io_runner(self.read_events_sync, max_batch)
 
     def read_events_sync(self, max_batch: int = 100) -> List[Dict[str, Any]]:
         processing = bounded_json_files(self.events_processing, max_batch)
@@ -1234,7 +2056,7 @@ class FileQueueHelperClient:
         return result
 
     async def ack_event(self, event: Dict[str, Any]) -> None:
-        await run_blocking(self.ack_event_sync, event)
+        await self._io_runner(self.ack_event_sync, event)
 
     def ack_event_sync(self, event: Dict[str, Any]) -> None:
         path = Path(safe_str(event.get("_gateway_event_path")))
@@ -1242,7 +2064,7 @@ class FileQueueHelperClient:
             path.unlink()
 
     async def fail_event(self, event: Dict[str, Any]) -> None:
-        await run_blocking(self.fail_event_sync, event)
+        await self._io_runner(self.fail_event_sync, event)
 
     def fail_event_sync(self, event: Dict[str, Any]) -> None:
         path = Path(safe_str(event.get("_gateway_event_path")))
@@ -1254,7 +2076,7 @@ class FileQueueHelperClient:
         os.replace(str(path), str(target))
 
     async def retry_event(self, event: Dict[str, Any]) -> bool:
-        return await run_blocking(self.retry_event_sync, event)
+        return await self._io_runner(self.retry_event_sync, event)
 
     def retry_event_sync(self, event: Dict[str, Any]) -> bool:
         path = Path(safe_str(event.get("_gateway_event_path")))
@@ -1288,7 +2110,17 @@ class FileQueueHelperClient:
 class AccountRuntime:
     def __init__(self, cfg: AccountConfig, logger: logging.Logger) -> None:
         self.cfg = cfg
-        self.helper = FileQueueHelperClient(cfg, logger)
+        self.file_io = BoundedExecutorLane(
+            "%s-file" % safe_filename(cfg.name),
+            max_workers=2,
+            max_pending=FILE_IO_MAX_PENDING_PER_ACCOUNT,
+        )
+        self.db_io = BoundedExecutorLane(
+            "%s-db" % safe_filename(cfg.name),
+            max_workers=1,
+            max_pending=DB_IO_MAX_PENDING_PER_ACCOUNT,
+        )
+        self.helper = FileQueueHelperClient(cfg, logger, io_runner=self.file_io.run)
         runtime_root = Path(cfg.runtime_dir)
         self.correlation = OrderCorrelationStore(runtime_root / "gateway_state.sqlite3")
         self.writer_lease = WriterLease(runtime_root / "active_writer.lock")
@@ -1309,22 +2141,85 @@ class AccountRuntime:
         for row in pending_rows:
             self.remember_order_correlation(row)
         self.pending_responses: Dict[str, Dict[str, Any]] = {}
-        for row in pending_rows:
-            request_id = safe_str(row.get("request_id"))
+        for item in self.correlation.load_pending_responses(cfg.account_id):
+            request_id = safe_str(item.pop("request_id", ""))
             if request_id:
-                self.pending_responses[request_id] = {
-                    "payload": dict(row),
-                    "queued_at": safe_float(row.get("created_at"), now()),
-                    "deadline_at": now() + cfg.request_timeout_seconds,
-                    "recovered": True,
-                }
+                if not safe_str(item.get("fingerprint")).strip():
+                    payload = (
+                        item.get("payload")
+                        if isinstance(item.get("payload"), dict)
+                        else {}
+                    )
+                    effect_kind, fingerprint = durable_effect_identity(
+                        safe_str(item.get("kind") or "order"),
+                        payload,
+                    )
+                    item["fingerprint"] = fingerprint
+                    self.correlation.adopt_legacy_pending_response(
+                        cfg.account_id,
+                        request_id,
+                        safe_str(item.get("kind") or "order"),
+                        effect_kind,
+                        fingerprint,
+                        item,
+                    )
+                payload = (
+                    item.get("payload")
+                    if isinstance(item.get("payload"), dict)
+                    else {}
+                )
+                effect_record = self.correlation.get_effect_request(
+                    cfg.account_id,
+                    request_id,
+                )
+                if (
+                    isinstance(effect_record, dict)
+                    and safe_str(effect_record.get("state")).upper() == "PREPARED"
+                    and safe_str(effect_record.get("fingerprint"))
+                    == safe_str(item.get("fingerprint"))
+                ):
+                    # A crash before the durable DISPATCHING barrier cannot
+                    # have called the Helper. Remove its stale async ledger so
+                    # reconnecting cannot receive a false timeout.
+                    if safe_str(item.get("kind")).lower() == "order":
+                        self.correlation.release_unstarted_order(
+                            cfg.account_id,
+                            safe_str(payload.get("client_order_id")),
+                            safe_str(payload.get("intent_hash")),
+                            request_id,
+                            safe_str(item.get("fingerprint")),
+                        )
+                    else:
+                        self.correlation.release_unstarted_cancel(
+                            cfg.account_id,
+                            request_id,
+                            safe_str(item.get("fingerprint")),
+                        )
+                    continue
+                self.pending_responses[request_id] = dict(item)
         self.pending_lock = asyncio.Lock()
-        self.pending_response_reservations: Set[str] = set()
+        self.pending_response_reservations: Dict[str, str] = {}
+        self.effect_request_lock = asyncio.Lock()
+        self.effect_request_reservations: Dict[str, str] = {}
         self.response_delivery_tasks: Dict[str, asyncio.Task] = {}
+        self.response_change_watcher: Optional[WindowsDirectoryWatcher] = None
+        self.event_change_watcher: Optional[WindowsDirectoryWatcher] = None
         self.response_fallback_cursor = 0
         self.effect_lock = asyncio.Lock()
         self.effect_inflight = 0
-        self.delivery_waiters: Dict[str, asyncio.Event] = {}
+        self.last_gateway_enqueue_seq = time.time_ns()
+        self.effect_enqueue_tail: Optional[asyncio.Future] = None
+        self.command_capacity_lock = asyncio.Lock()
+        self.command_capacity_reserved = 0
+        self.command_enqueue_total = 0
+        self.command_depth_sample_enqueue_total = 0
+        self.command_queue_depth = 0
+        self.helper_health: Dict[str, Any] = {}
+        self.helper_health_sampled_monotonic = 0.0
+        self.delivery_waiters: Dict[
+            str,
+            tuple[TcpClientSession, asyncio.Event],
+        ] = {}
         self.delivery_lock = asyncio.Lock()
         self.query_semaphore = asyncio.Semaphore(max(1, cfg.query_concurrency))
         self.query_singleflight: Dict[str, asyncio.Task] = {}
@@ -1346,6 +2241,28 @@ class AccountRuntime:
             "updated_at": now(),
         }
 
+    def next_gateway_enqueue_seq(self) -> int:
+        self.last_gateway_enqueue_seq = max(
+            self.last_gateway_enqueue_seq + 1,
+            time.time_ns(),
+        )
+        return self.last_gateway_enqueue_seq
+
+    def attach_effect_enqueue_turn(self, msg: Dict[str, Any]) -> None:
+        if isinstance(msg.get("_gateway_enqueue_completion"), asyncio.Future):
+            return
+        loop = asyncio.get_running_loop()
+        completion = loop.create_future()
+        msg["_gateway_enqueue_predecessor"] = self.effect_enqueue_tail
+        msg["_gateway_enqueue_completion"] = completion
+        self.effect_enqueue_tail = completion
+
+    @staticmethod
+    def finish_effect_enqueue_turn(msg: Dict[str, Any]) -> None:
+        completion = msg.get("_gateway_enqueue_completion")
+        if isinstance(completion, asyncio.Future) and not completion.done():
+            completion.set_result(None)
+
     async def try_acquire_effect(self) -> bool:
         async with self.effect_lock:
             if self.effect_inflight >= MAX_EFFECT_INFLIGHT_PER_ACCOUNT:
@@ -1358,27 +2275,193 @@ class AccountRuntime:
             if self.effect_inflight > 0:
                 self.effect_inflight -= 1
 
-    async def try_reserve_pending_response(self, request_id: str) -> tuple[bool, bool]:
-        """Return (capacity_available, reservation_owned_by_caller)."""
+    async def try_reserve_command_capacity(self) -> bool:
+        """Reserve one effect slot using the latest bounded disk-depth sample."""
+        async with self.command_capacity_lock:
+            recent_enqueues = max(
+                0,
+                self.command_enqueue_total
+                - self.command_depth_sample_enqueue_total,
+            )
+            estimated_depth = (
+                self.command_queue_depth
+                + recent_enqueues
+                + self.command_capacity_reserved
+            )
+            if estimated_depth >= COMMAND_QUEUE_HIGH_WATER_PER_ACCOUNT:
+                return False
+            self.command_capacity_reserved += 1
+            return True
+
+    async def release_command_capacity(self, enqueued: bool = False) -> None:
+        async with self.command_capacity_lock:
+            if self.command_capacity_reserved > 0:
+                self.command_capacity_reserved -= 1
+            if enqueued:
+                self.command_enqueue_total += 1
+
+    async def cache_helper_health(
+        self,
+        health: Dict[str, Any],
+        sample_enqueue_total: int,
+    ) -> None:
+        async with self.command_capacity_lock:
+            self.helper_health = dict(health or {})
+            self.helper_health_sampled_monotonic = time.monotonic()
+            self.command_queue_depth = max(
+                0,
+                safe_int(health.get("command_queue_depth"), 0),
+            )
+            # The scan may include newer files.  Counting enqueues completed
+            # during the scan once more is deliberately conservative and is
+            # corrected by the next 100 ms sample.
+            self.command_depth_sample_enqueue_total = max(
+                0,
+                int(sample_enqueue_total),
+            )
+
+    async def helper_health_snapshot(self) -> tuple[Dict[str, Any], float]:
+        async with self.command_capacity_lock:
+            health = dict(self.helper_health)
+            sampled = self.helper_health_sampled_monotonic
+        age = time.monotonic() - sampled if sampled else 10**9
+        return health, age
+
+    async def try_reserve_pending_response(
+        self,
+        request_id: str,
+        fingerprint: str,
+        allow_prepared_takeover: bool = False,
+    ) -> tuple[bool, bool, str]:
+        """Return (capacity, owned, existing/conflict code)."""
         async with self.pending_lock:
-            if request_id in self.pending_responses or request_id in self.pending_response_reservations:
-                return True, False
+            existing = self.pending_responses.get(request_id)
+            if existing is not None:
+                existing_fingerprint = safe_str(existing.get("fingerprint"))
+                if (
+                    allow_prepared_takeover
+                    and existing_fingerprint
+                    and existing_fingerprint == fingerprint
+                    and not existing.get("response_captured")
+                    and not isinstance(existing.get("ready_response"), dict)
+                ):
+                    return True, False, ""
+                if (
+                    existing_fingerprint == fingerprint
+                    and (
+                        existing.get("response_captured")
+                        or isinstance(existing.get("ready_response"), dict)
+                    )
+                ):
+                    return True, False, "EFFECT_STATE_UNKNOWN"
+                code = (
+                    "REQUEST_IN_PROGRESS"
+                    if existing_fingerprint and existing_fingerprint == fingerprint
+                    else "REQUEST_ID_CONFLICT"
+                )
+                return True, False, code
+            reserved_fingerprint = self.pending_response_reservations.get(request_id)
+            if reserved_fingerprint is not None:
+                code = (
+                    "REQUEST_IN_PROGRESS"
+                    if reserved_fingerprint == fingerprint
+                    else "REQUEST_ID_CONFLICT"
+                )
+                return True, False, code
             if len(self.response_delivery_tasks) >= MAX_RESPONSE_DELIVERY_TASKS_PER_ACCOUNT:
-                return False, False
+                return False, False, ""
             occupied = len(self.pending_responses) + len(self.pending_response_reservations)
             if occupied >= MAX_PENDING_RESPONSES_PER_ACCOUNT:
-                return False, False
-            self.pending_response_reservations.add(request_id)
-            return True, True
+                return False, False, ""
+            self.pending_response_reservations[request_id] = fingerprint
+            return True, True, ""
 
     async def commit_pending_response(self, request_id: str, item: Dict[str, Any]) -> None:
+        await self.db_io.run(
+            self.correlation.save_pending_response,
+            self.cfg.account_id,
+            request_id,
+            item,
+        )
         async with self.pending_lock:
-            self.pending_response_reservations.discard(request_id)
-            self.pending_responses[request_id] = item
+            self.pending_response_reservations.pop(request_id, None)
+            self.pending_responses[request_id] = dict(item)
+
+    async def remove_pending_response(self, request_id: str) -> None:
+        await self.delete_pending_response_record(request_id)
+        await self.forget_pending_response(request_id)
+
+    async def delete_pending_response_record(self, request_id: str) -> None:
+        await self.db_io.run(
+            self.correlation.remove_pending_response,
+            self.cfg.account_id,
+            request_id,
+        )
+
+    async def run_db_cleanup(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+        timeout: float = 2.0,
+    ) -> Any:
+        """Wait boundedly for DB-lane capacity needed to undo no-effect state."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.01, float(timeout))
+        while True:
+            try:
+                return await self.db_io.run(func, *args)
+            except IoLaneFull:
+                if loop.time() >= deadline:
+                    raise
+                await asyncio.sleep(0.001)
+
+    async def transition_effect_request(
+        self,
+        request_id: str,
+        fingerprint: str,
+        state: str,
+        result: Optional[Dict[str, Any]] = None,
+        allowed_from: tuple[str, ...] = ("PREPARED",),
+    ) -> bool:
+        return bool(await self.db_io.run(
+            self.correlation.transition_effect_request,
+            self.cfg.account_id,
+            request_id,
+            fingerprint,
+            state,
+            result,
+            allowed_from,
+        ))
+
+    async def forget_pending_response(self, request_id: str) -> None:
+        async with self.pending_lock:
+            self.pending_response_reservations.pop(request_id, None)
+            self.pending_responses.pop(request_id, None)
 
     async def release_pending_response_reservation(self, request_id: str) -> None:
         async with self.pending_lock:
-            self.pending_response_reservations.discard(request_id)
+            self.pending_response_reservations.pop(request_id, None)
+
+    async def try_reserve_effect_request(
+        self,
+        request_id: str,
+        fingerprint: str,
+    ) -> tuple[bool, str]:
+        """Reserve one process-local trading effect for a request ID."""
+        async with self.effect_request_lock:
+            existing = self.effect_request_reservations.get(request_id)
+            if existing is not None:
+                return False, (
+                    "REQUEST_IN_PROGRESS"
+                    if existing == fingerprint
+                    else "REQUEST_ID_CONFLICT"
+                )
+            self.effect_request_reservations[request_id] = fingerprint
+            return True, ""
+
+    async def release_effect_request(self, request_id: str) -> None:
+        async with self.effect_request_lock:
+            self.effect_request_reservations.pop(request_id, None)
 
     def next_response_fallback_ids(
         self,
@@ -1398,14 +2481,42 @@ class AccountRuntime:
         self.response_fallback_cursor = (start + count) % len(request_ids)
         return selected
 
-    def remember(self, msg_id: str, reply: Dict[str, Any]) -> None:
+    def remember(
+        self,
+        msg_id: str,
+        reply: Dict[str, Any],
+        effect_fingerprint: str = "",
+    ) -> None:
         if not msg_id:
             return
-        self.done[msg_id] = dict(reply)
+        self.done[msg_id] = {
+            "reply": dict(reply),
+            "effect_fingerprint": safe_str(effect_fingerprint),
+        }
         self.done_order.append(msg_id)
         while len(self.done_order) > 2000:
             old = self.done_order.pop(0)
             self.done.pop(old, None)
+
+    def cached_effect_reply(
+        self,
+        msg_id: str,
+        effect_fingerprint: str,
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        if not msg_id:
+            return None, ""
+        record = self.done.get(msg_id)
+        if not isinstance(record, dict):
+            return None, ""
+        cached_fingerprint = safe_str(record.get("effect_fingerprint"))
+        reply = record.get("reply")
+        if not isinstance(reply, dict):
+            return None, ""
+        if not cached_fingerprint or cached_fingerprint != effect_fingerprint:
+            return None, "REQUEST_ID_CONFLICT"
+        result = dict(reply)
+        result["cached"] = True
+        return result, ""
 
     def get_order_intent_duplicate(self, key: str) -> Optional[Dict[str, Any]]:
         if not key:
@@ -1546,7 +2657,7 @@ class AccountRuntime:
                 return payloads
 
             lookup_items = [payloads[index] for index in unresolved_indexes]
-            rows = await run_blocking(
+            rows = await self.db_io.run(
                 self.correlation.resolve_many, self.cfg.account_id, lookup_items,
             )
             for index, row in enumerate(rows):
@@ -1762,34 +2873,54 @@ class BigQmtGatewayProxy:
         if self.running:
             return
         self.running = True
-        self.logger.info(
-            "proxy_start build=%s accounts=%s helper_mode=file_queue",
-            PROXY_BUILD_ID,
-            len(self.runtimes),
-        )
-        for runtime in self.runtimes:
-            lease_token = runtime.writer_lease.acquire()
-            server = await asyncio.start_server(
-                lambda r, w, rt=runtime: self.handle_client(rt, r, w),
-                host=runtime.cfg.tcp_host,
-                port=runtime.cfg.tcp_port,
-                backlog=self.cfg.listen_backlog,
-            )
-            runtime.server = server
+        try:
             self.logger.info(
-                "tcp_listen account=%s name=%s host=%s port=%s runtime_dir=%s writer_token=%s",
-                runtime.cfg.account_id,
-                runtime.cfg.name,
-                runtime.cfg.tcp_host,
-                runtime.cfg.tcp_port,
-                runtime.cfg.runtime_dir,
-                lease_token[:8],
-
+                "proxy_start build=%s accounts=%s helper_mode=file_queue",
+                PROXY_BUILD_ID,
+                len(self.runtimes),
             )
-            self.poll_tasks.append(asyncio.create_task(self.poll_account_loop(runtime)))
-            self.poll_tasks.append(asyncio.create_task(self.response_watcher_loop(runtime)))
-            self.poll_tasks.append(asyncio.create_task(self.live_event_watcher_loop(runtime)))
-            self.poll_tasks.append(asyncio.create_task(self.maintenance_loop(runtime)))
+            for runtime in self.runtimes:
+                lease_token = runtime.writer_lease.acquire()
+                # Prime the fail-closed cache before accepting the first client.
+                # An offline Helper does not prevent the gateway from starting;
+                # it simply makes trading requests reject as HELPER_NOT_READY.
+                await self._sample_helper_health(runtime)
+                runtime.response_change_watcher = WindowsDirectoryWatcher(
+                    runtime.helper.responses,
+                    retry_interval=0.25,
+                    default_timeout=runtime.cfg.response_watch_interval_seconds,
+                    thread_name="qmt-response-%s" % safe_filename(runtime.cfg.name),
+                )
+                runtime.event_change_watcher = WindowsDirectoryWatcher(
+                    runtime.helper.events_live,
+                    retry_interval=0.25,
+                    default_timeout=runtime.cfg.event_watch_interval_seconds,
+                    thread_name="qmt-event-%s" % safe_filename(runtime.cfg.name),
+                )
+                server = await asyncio.start_server(
+                    lambda r, w, rt=runtime: self.handle_client(rt, r, w),
+                    host=runtime.cfg.tcp_host,
+                    port=runtime.cfg.tcp_port,
+                    backlog=self.cfg.listen_backlog,
+                )
+                runtime.server = server
+                self.logger.info(
+                    "tcp_listen account=%s name=%s host=%s port=%s runtime_dir=%s writer_token=%s",
+                    runtime.cfg.account_id,
+                    runtime.cfg.name,
+                    runtime.cfg.tcp_host,
+                    runtime.cfg.tcp_port,
+                    runtime.cfg.runtime_dir,
+                    lease_token[:8],
+                )
+                self.poll_tasks.append(asyncio.create_task(self.helper_health_sampler_loop(runtime)))
+                self.poll_tasks.append(asyncio.create_task(self.poll_account_loop(runtime)))
+                self.poll_tasks.append(asyncio.create_task(self.response_watcher_loop(runtime)))
+                self.poll_tasks.append(asyncio.create_task(self.live_event_watcher_loop(runtime)))
+                self.poll_tasks.append(asyncio.create_task(self.maintenance_loop(runtime)))
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
         has_delivery_work = any(
@@ -1810,6 +2941,30 @@ class BigQmtGatewayProxy:
             task.cancel()
         await asyncio.gather(*self.poll_tasks, return_exceptions=True)
         self.poll_tasks.clear()
+        directory_watchers = [
+            watcher
+            for runtime in self.runtimes
+            for watcher in (
+                runtime.response_change_watcher,
+                runtime.event_change_watcher,
+            )
+            if watcher is not None
+        ]
+        for watcher in directory_watchers:
+            watcher.close()
+        watcher_results = await asyncio.gather(*(
+            watcher.aclose(1.0) for watcher in directory_watchers
+        ), return_exceptions=True)
+        for watcher, result in zip(directory_watchers, watcher_results):
+            if result is not True:
+                self.logger.warning(
+                    "directory_watcher_close_incomplete path=%s result=%s",
+                    watcher.path,
+                    result,
+                )
+        for runtime in self.runtimes:
+            runtime.response_change_watcher = None
+            runtime.event_change_watcher = None
         response_delivery_tasks = [
             task
             for runtime in self.runtimes
@@ -1835,13 +2990,15 @@ class BigQmtGatewayProxy:
                 *(self.unregister_client(runtime, client) for client in clients),
                 return_exceptions=True,
             )
+            runtime.file_io.close()
+            runtime.db_io.close()
             runtime.correlation.close()
             runtime.writer_lease.release()
 
     async def register_client(self, runtime: AccountRuntime, session: TcpClientSession) -> None:
         async with runtime.clients_lock:
             old_clients = list(runtime.clients)
-            runtime.clients.add(session)
+            runtime.clients = {session}
             runtime.primary = session
         for old in old_clients:
             asyncio.create_task(old.close("replaced"))
@@ -1918,6 +3075,90 @@ class BigQmtGatewayProxy:
             reply["seq"] = -1
         return reply
 
+    @staticmethod
+    def request_state_reply(
+        runtime: AccountRuntime,
+        msg: Dict[str, Any],
+        code: str,
+    ) -> Dict[str, Any]:
+        conflict = code == "REQUEST_ID_CONFLICT"
+        unknown_state = code in {
+            "EFFECT_STATE_UNKNOWN",
+            "EFFECT_ALREADY_ENQUEUED",
+            "EFFECT_ALREADY_FINALIZED",
+        }
+        reply = {
+            "protocol_version": 2,
+            "type": {
+                "NEW": "EXEC_REPORT",
+                "NEW_ASYNC": "ASYNC_ORDER",
+                "CANCEL": "EXEC_REPORT",
+                "CANCEL_ASYNC": "ASYNC_CANCEL",
+                "CANCEL_SYSID": "EXEC_REPORT",
+                "CANCEL_SYSID_ASYNC": "ASYNC_CANCEL",
+            }.get(safe_str(msg.get("type")), "ERROR"),
+            "msg_id": safe_str(msg.get("msg_id")),
+            "status": "REJECTED" if conflict else "UNKNOWN",
+            "stage": (
+                "REJECTED" if conflict
+                else "SUBMIT_UNKNOWN" if unknown_state
+                else "RESERVED"
+            ),
+            "code": code,
+            "effect_started": unknown_state,
+            "retryable": False,
+            "account_id": runtime.cfg.account_id,
+            "request_id": safe_str(msg.get("request_id")),
+            "client_order_id": safe_str(msg.get("client_order_id")),
+            "trace_id": safe_str(msg.get("trace_id")),
+            "reject_reason": {
+                "REQUEST_ID_CONFLICT": (
+                    "request_id was already used for a different trading effect"
+                ),
+                "REQUEST_IN_PROGRESS": (
+                    "the same request_id and trading effect are already in progress"
+                ),
+                "EFFECT_ALREADY_ENQUEUED": (
+                    "the trading effect was already enqueued; do not resubmit"
+                ),
+                "EFFECT_ALREADY_FINALIZED": (
+                    "the trading effect was already finalized; do not resubmit"
+                ),
+                "EFFECT_STATE_UNKNOWN": (
+                    "the request crossed the durable dispatch barrier but its result is unknown; reconcile before any new action"
+                ),
+            }.get(code, "request state prevents a new trading effect"),
+            "timestamp": now(),
+        }
+        if safe_str(msg.get("type")).endswith("_ASYNC"):
+            reply["seq"] = -1
+        return reply
+
+    def effect_request_identity(
+        self,
+        runtime: AccountRuntime,
+        msg: Dict[str, Any],
+    ) -> tuple[str, str]:
+        msg_type = safe_str(msg.get("type")).upper()
+        if msg_type.startswith("NEW"):
+            payload = self.order_payload(runtime, msg)
+            return durable_effect_identity("order", payload)
+        else:
+            sysid = msg_type.startswith("CANCEL_SYSID")
+            kind = "cancel_sysid" if sysid else "cancel_order"
+            payload = {
+                "account_id": runtime.cfg.account_id,
+                "account_type": runtime.cfg.account_type,
+                "order_id": "" if sysid else safe_str(msg.get("order_id")).strip(),
+                "order_sysid": (
+                    first_nonempty_stripped(msg.get("order_sysid"), msg.get("order_id"))
+                    if sysid
+                    else safe_str(msg.get("order_sysid")).strip()
+                ),
+                "market": msg.get("market", 0),
+            }
+            return durable_effect_identity(kind, payload)
+
     async def handle_client(self, runtime: AccountRuntime, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         session = TcpClientSession(runtime, reader, writer, self.max_frame_bytes)
         self.logger.info("tcp_accept port=%s peer=%s", runtime.cfg.tcp_port, session.peer)
@@ -1928,6 +3169,13 @@ class BigQmtGatewayProxy:
                     break
                 session.last_recv_at = now()
                 msg["_gateway_received_at_ns"] = time.time_ns()
+                if safe_str(msg.get("type")) in {
+                    "NEW", "NEW_ASYNC", "CANCEL", "CANCEL_ASYNC",
+                    "CANCEL_SYSID", "CANCEL_SYSID_ASYNC",
+                }:
+                    msg["_gateway_enqueue_seq"] = runtime.next_gateway_enqueue_seq()
+                    if session.registered:
+                        runtime.attach_effect_enqueue_turn(msg)
                 raw_msg_id = msg.get("msg_id")
                 msg_id_matches_auth_token = (
                     isinstance(raw_msg_id, str)
@@ -1939,6 +3187,11 @@ class BigQmtGatewayProxy:
                 if msg_id_matches_auth_token:
                     msg["msg_id"] = "<redacted-secret>"
                 if session.registered and msg_id_matches_auth_token:
+                    # Release the account-wide enqueue turn before an I/O
+                    # operation that can fail or be cancelled.  Otherwise a
+                    # broken client could leave every later effect waiting on
+                    # an unresolved predecessor future.
+                    runtime.finish_effect_enqueue_turn(msg)
                     await session.send({
                         "type": "ERROR",
                         "msg_id": "<redacted-secret>",
@@ -2008,9 +3261,16 @@ class BigQmtGatewayProxy:
                     await self._dispatch_and_send(runtime, session, msg)
                     continue
                 if not session.dispatch_capacity_available():
+                    runtime.finish_effect_enqueue_turn(msg)
                     await session.send(self.gateway_busy_reply(runtime, msg, "connection_dispatch"))
                     continue
-                task = asyncio.create_task(self._dispatch_and_send(runtime, session, msg))
+                try:
+                    task = asyncio.create_task(
+                        self._dispatch_and_send(runtime, session, msg)
+                    )
+                except Exception:
+                    runtime.finish_effect_enqueue_turn(msg)
+                    raise
                 session.dispatch_tasks.add(task)
                 if msg_type in EFFECTFUL_DISPATCH_MESSAGE_TYPES:
                     session.effect_dispatch_tasks.add(task)
@@ -2060,6 +3320,8 @@ class BigQmtGatewayProxy:
                     "reject_reason": safe_str(exc),
                     "timestamp": now(),
                 })
+        finally:
+            runtime.finish_effect_enqueue_turn(msg)
 
     async def dispatch(self, runtime: AccountRuntime, session: TcpClientSession, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         msg_type = safe_str(msg.get("type"), "")
@@ -2087,10 +3349,6 @@ class BigQmtGatewayProxy:
                     "reject_reason": "message account identity does not match the authenticated connection",
                     "timestamp": now(),
                 }
-        if msg_id and msg_type != "QUERY" and msg_id in runtime.done:
-            cached = dict(runtime.done[msg_id])
-            cached["cached"] = True
-            return cached
         if msg_type == "PING":
             return {
                 "type": "PONG",
@@ -2109,9 +3367,11 @@ class BigQmtGatewayProxy:
         if msg_type == "DELIVERY_ACK":
             delivery_id = safe_str(msg.get("delivery_id"))
             async with runtime.delivery_lock:
-                waiter = runtime.delivery_waiters.get(delivery_id)
-                if waiter is not None:
-                    waiter.set()
+                waiter_record = runtime.delivery_waiters.get(delivery_id)
+                if waiter_record is not None:
+                    target_session, waiter = waiter_record
+                    if session is target_session and runtime.primary is session:
+                        waiter.set()
             return None
         if msg_type == "QUERY":
             return await self.handle_query_brokered(runtime, msg)
@@ -2119,22 +3379,134 @@ class BigQmtGatewayProxy:
             "NEW", "NEW_ASYNC", "CANCEL", "CANCEL_ASYNC",
             "CANCEL_SYSID", "CANCEL_SYSID_ASYNC",
         }:
+            msg = dict(msg)
+            runtime.attach_effect_enqueue_turn(msg)
+            predecessor = msg.get("_gateway_enqueue_predecessor")
+            if isinstance(predecessor, asyncio.Future):
+                await asyncio.shield(predecessor)
+            if safe_int(msg.get("_gateway_enqueue_seq"), 0) <= 0:
+                msg["_gateway_enqueue_seq"] = runtime.next_gateway_enqueue_seq()
+            canonical_request_id = first_nonempty_stripped(
+                msg.get("request_id"),
+                msg.get("client_order_id"),
+                msg_id,
+            ) or make_request_id(
+                "cancel" if msg_type.startswith("CANCEL") else "order"
+            )
+            msg["request_id"] = canonical_request_id
+            effect_kind, effect_fingerprint = self.effect_request_identity(
+                runtime,
+                msg,
+            )
+            msg["_gateway_effect_fingerprint"] = effect_fingerprint
+            cached, cached_code = runtime.cached_effect_reply(
+                msg_id,
+                effect_fingerprint,
+            )
+            if cached is not None:
+                runtime.finish_effect_enqueue_turn(msg)
+                return cached
+            if cached_code:
+                runtime.finish_effect_enqueue_turn(msg)
+                return self.request_state_reply(runtime, msg, cached_code)
+            if not await runtime.try_reserve_command_capacity():
+                runtime.finish_effect_enqueue_turn(msg)
+                return self.gateway_busy_reply(runtime, msg, "account_command_queue")
             if not await runtime.try_acquire_effect():
+                await runtime.release_command_capacity(False)
+                runtime.finish_effect_enqueue_turn(msg)
                 return self.gateway_busy_reply(runtime, msg, "account_effect_inflight")
             pending_request_id = ""
             pending_reservation_owned = False
+            effect_request_owned = False
+            command_effect_attempted = False
             try:
-                if msg_type == "NEW_ASYNC" and safe_str(msg.get("client_order_id")).strip():
+                effect_request_owned, effect_code = (
+                    await runtime.try_reserve_effect_request(
+                        canonical_request_id,
+                        effect_fingerprint,
+                    )
+                )
+                if effect_code:
+                    return self.request_state_reply(runtime, msg, effect_code)
+                try:
+                    effect_record, effect_duplicate = await runtime.db_io.run(
+                        runtime.correlation.reserve_effect_request,
+                        runtime.cfg.account_id,
+                        canonical_request_id,
+                        effect_kind,
+                        effect_fingerprint,
+                    )
+                except IdempotencyConflict:
+                    return self.request_state_reply(
+                        runtime,
+                        msg,
+                        "REQUEST_ID_CONFLICT",
+                    )
+                except IoLaneFull:
+                    return self.gateway_busy_reply(
+                        runtime,
+                        msg,
+                        "account_db_io",
+                    )
+                if effect_duplicate:
+                    persisted_state = safe_str(
+                        effect_record.get("state")
+                    ).upper()
+                    persisted_result = effect_record.get("result")
+                    if persisted_state != "PREPARED":
+                        if isinstance(persisted_result, dict):
+                            replay = dict(persisted_result)
+                            replay["msg_id"] = msg_id
+                            if safe_str(msg.get("trace_id")).strip():
+                                replay["trace_id"] = safe_str(msg.get("trace_id")).strip()
+                            replay["idempotent"] = True
+                            replay["dedupe_layer"] = "gateway_effect_registry"
+                            replay["cached"] = True
+                            return replay
+                        persisted_code = {
+                            "DISPATCHING": "EFFECT_STATE_UNKNOWN",
+                            "ENQUEUED": "EFFECT_ALREADY_ENQUEUED",
+                            "TERMINAL": "EFFECT_ALREADY_FINALIZED",
+                            "UNKNOWN": "EFFECT_STATE_UNKNOWN",
+                        }.get(persisted_state, "EFFECT_STATE_UNKNOWN")
+                        return self.request_state_reply(
+                            runtime,
+                            msg,
+                            persisted_code,
+                        )
+                    msg["_gateway_prepared_recovery"] = True
+                if msg_type.endswith("_ASYNC") and (
+                    msg_type != "NEW_ASYNC"
+                    or safe_str(msg.get("client_order_id")).strip()
+                ):
                     pending_request_id = first_nonempty_stripped(
                         msg.get("request_id"),
                         msg.get("client_order_id"),
                         msg_id,
                     )
-                    capacity_available, pending_reservation_owned = (
-                        await runtime.try_reserve_pending_response(pending_request_id)
+                    capacity_available, pending_reservation_owned, pending_code = (
+                        await runtime.try_reserve_pending_response(
+                            pending_request_id,
+                            effect_fingerprint,
+                            bool(msg.get("_gateway_prepared_recovery")),
+                        )
                     )
                     if not capacity_available:
                         return self.gateway_busy_reply(runtime, msg, "account_pending_response")
+                    if pending_code:
+                        if pending_code == "EFFECT_STATE_UNKNOWN":
+                            try:
+                                await runtime.transition_effect_request(
+                                    canonical_request_id,
+                                    effect_fingerprint,
+                                    "UNKNOWN",
+                                    allowed_from=("PREPARED",),
+                                )
+                            except Exception:
+                                pass
+                        return self.request_state_reply(runtime, msg, pending_code)
+                command_effect_attempted = True
                 if msg_type in ("NEW", "NEW_ASYNC"):
                     reply = await self.handle_new(
                         runtime,
@@ -2153,11 +3525,49 @@ class BigQmtGatewayProxy:
                         msg,
                         async_mode=(msg_type == "CANCEL_SYSID_ASYNC"),
                     )
-                runtime.remember(msg_id, reply)
+                effect_state = safe_str(
+                    reply.pop("_gateway_effect_state", "PREPARED")
+                ).upper()
+                cacheable = bool(
+                    reply.pop("_gateway_cacheable", effect_state != "PREPARED")
+                )
+                if effect_state in {"ENQUEUED", "UNKNOWN", "TERMINAL"}:
+                    try:
+                        transitioned = await runtime.transition_effect_request(
+                            canonical_request_id,
+                            effect_fingerprint,
+                            effect_state,
+                            dict(reply),
+                            allowed_from=("PREPARED", "DISPATCHING"),
+                        )
+                        if not transitioned:
+                            self.logger.error(
+                                "effect_state_transition_rejected account=%s request_id=%s state=%s",
+                                runtime.cfg.account_id,
+                                canonical_request_id,
+                                effect_state,
+                            )
+                    except Exception as exc:
+                        # DISPATCHING is a fail-closed durable barrier.  Even
+                        # when result persistence is temporarily unavailable,
+                        # a retry cannot execute the effect again.
+                        self.logger.error(
+                            "effect_state_transition_failed account=%s request_id=%s state=%s error=%s",
+                            runtime.cfg.account_id,
+                            canonical_request_id,
+                            effect_state,
+                            exc,
+                        )
+                if cacheable:
+                    runtime.remember(msg_id, reply, effect_fingerprint)
                 return reply
             finally:
                 if pending_reservation_owned:
                     await runtime.release_pending_response_reservation(pending_request_id)
+                if effect_request_owned:
+                    await runtime.release_effect_request(canonical_request_id)
+                runtime.finish_effect_enqueue_turn(msg)
+                await runtime.release_command_capacity(command_effect_attempted)
                 await runtime.release_effect()
         if msg_type == "FUND_TRANSFER":
             return await self.handle_fund_transfer(runtime, msg)
@@ -2182,7 +3592,13 @@ class BigQmtGatewayProxy:
         }
 
     async def _ensure_helper_ready(self, runtime: AccountRuntime) -> Dict[str, Any]:
-        health = await runtime.helper.health()
+        health, cache_age = await runtime.helper_health_snapshot()
+        if not health or cache_age > HELPER_HEALTH_CACHE_MAX_AGE_SECONDS:
+            raise HelperUnavailable(
+                "helper health sample is stale: age_ms=%.3f"
+                % (cache_age * 1000.0),
+                "HELPER_HEALTH_STALE",
+            )
         runtime.update_status_ready(health)
         identity_failures = helper_identity_mismatches(runtime.cfg, health)
         if identity_failures:
@@ -2199,6 +3615,93 @@ class BigQmtGatewayProxy:
                 "HELPER_NOT_READY",
             )
         return health
+
+    async def _begin_effect_dispatch(
+        self,
+        runtime: AccountRuntime,
+        msg: Dict[str, Any],
+    ) -> None:
+        request_id = safe_str(msg.get("request_id")).strip()
+        fingerprint = safe_str(msg.get("_gateway_effect_fingerprint")).strip()
+        transitioned = await runtime.transition_effect_request(
+            request_id,
+            fingerprint,
+            "DISPATCHING",
+            allowed_from=("PREPARED",),
+        )
+        if not transitioned:
+            raise HelperError(
+                "effect request is no longer PREPARED",
+                "EFFECT_STATE_CONFLICT",
+            )
+
+    async def _rollback_unstarted_order(
+        self,
+        runtime: AccountRuntime,
+        payload: Dict[str, Any],
+    ) -> None:
+        await runtime.run_db_cleanup(
+            runtime.correlation.release_unstarted_order,
+            runtime.cfg.account_id,
+            safe_str(payload.get("client_order_id")),
+            safe_str(payload.get("intent_hash")),
+            safe_str(payload.get("request_id")),
+            safe_str(payload.get("gateway_effect_fingerprint")),
+        )
+        await runtime.forget_pending_response(
+            safe_str(payload.get("request_id"))
+        )
+
+    async def _rollback_unstarted_cancel(
+        self,
+        runtime: AccountRuntime,
+        payload: Dict[str, Any],
+    ) -> None:
+        await runtime.run_db_cleanup(
+            runtime.correlation.release_unstarted_cancel,
+            runtime.cfg.account_id,
+            safe_str(payload.get("request_id")),
+            safe_str(payload.get("gateway_effect_fingerprint")),
+        )
+        await runtime.forget_pending_response(
+            safe_str(payload.get("request_id"))
+        )
+
+    async def _sample_helper_health(self, runtime: AccountRuntime) -> Dict[str, Any]:
+        sample_enqueue_total = runtime.command_enqueue_total
+        try:
+            health = await runtime.helper.health()
+            await runtime.cache_helper_health(health, sample_enqueue_total)
+            runtime.update_status_ready(health)
+            return health
+        except Exception as exc:
+            health = {
+                "ready": False,
+                "alive": False,
+                "state": "offline",
+                "last_error": safe_str(exc),
+                "command_queue_depth": runtime.command_queue_depth,
+            }
+            await runtime.cache_helper_health(health, sample_enqueue_total)
+            runtime.update_status_offline(exc)
+            return health
+
+    async def helper_health_sampler_loop(self, runtime: AccountRuntime) -> None:
+        interval = HELPER_HEALTH_SAMPLE_INTERVAL_SECONDS
+        while self.running:
+            try:
+                await self._sample_helper_health(runtime)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                runtime.update_status_offline(exc)
+                self.logger.warning(
+                    "helper_health_sampler_failed account=%s error=%s",
+                    runtime.cfg.account_id,
+                    exc,
+                )
+                await asyncio.sleep(min(1.0, interval * 5))
 
     async def handle_query_brokered(self, runtime: AccountRuntime, msg: Dict[str, Any]) -> Dict[str, Any]:
         key = stable_hash({
@@ -2561,7 +4064,7 @@ class BigQmtGatewayProxy:
                 "timestamp": now(),
             }
         try:
-            existing, idempotent = await run_blocking(runtime.correlation.reserve, {
+            existing, idempotent = await runtime.db_io.run(runtime.correlation.reserve, {
                 **payload,
                 "stage": "RESERVED",
             })
@@ -2594,6 +4097,15 @@ class BigQmtGatewayProxy:
                 "timestamp": now(),
             }
         runtime.remember_order_correlation(existing)
+        if (
+            idempotent
+            and bool(msg.get("_gateway_prepared_recovery"))
+            and safe_str(existing.get("stage")).strip().upper() == "RESERVED"
+        ):
+            # PREPARED is durable proof that the QMT dispatch barrier was
+            # never crossed.  It is therefore safe to resume the exact
+            # correlation/pending rows left by a process crash.
+            idempotent = False
         if idempotent:
             existing_stage = safe_str(existing.get("stage") or "RESERVED").strip().upper()
             known_submitted_stages = {
@@ -2657,11 +4169,34 @@ class BigQmtGatewayProxy:
                 replay["code"] = replay_code
                 replay["reject_reason"] = replay_reason
                 replay["retryable"] = False
+            if existing_stage in {"FILLED", "CANCELLED", "REJECTED"}:
+                replay["_gateway_effect_state"] = "TERMINAL"
+            elif existing_stage == "SUBMIT_UNKNOWN":
+                replay["_gateway_effect_state"] = "UNKNOWN"
+            elif existing_stage in known_submitted_stages:
+                replay["_gateway_effect_state"] = "ENQUEUED"
             return replay
         effect_started = False
+        helper_completed = False
         try:
+            if async_mode:
+                await runtime.commit_pending_response(payload["request_id"], {
+                    "kind": "order",
+                    "fingerprint": safe_str(
+                        msg.get("_gateway_effect_fingerprint")
+                    ),
+                    "payload": dict(payload),
+                    "queued_at": now(),
+                    "deadline_at": now() + runtime.cfg.request_timeout_seconds,
+                })
+            await self._begin_effect_dispatch(runtime, msg)
             effect_started = True
-            data = await runtime.helper.place_order(payload, wait=not async_mode)
+            data = await runtime.helper.place_order(
+                payload,
+                wait=not async_mode,
+                enqueue_done=lambda: runtime.finish_effect_enqueue_turn(msg),
+            )
+            helper_completed = True
             submit_status = safe_str(data.get("status") or "queued").strip().lower()
             failed = submit_status == "failed"
             submit_unknown = submit_status == "submit_unknown"
@@ -2709,21 +4244,22 @@ class BigQmtGatewayProxy:
                     reply["reject_reason"] = (
                         "QMT returned no stable submission result; do not retry automatically"
                     )
-                    await run_blocking(
+                    await runtime.db_io.run(
                         runtime.correlation.update_stage,
                         runtime.cfg.account_id,
                         payload["client_order_id"],
                         "SUBMIT_UNKNOWN",
                     )
                 elif not failed:
-                    await run_blocking(runtime.correlation.update_stage, runtime.cfg.account_id, payload["client_order_id"], "BRIDGE_QUEUED")
-                    await runtime.commit_pending_response(payload["request_id"], {
-                        "payload": dict(payload),
-                        "queued_at": now(),
-                        "deadline_at": now() + runtime.cfg.request_timeout_seconds,
-                    })
+                    await runtime.db_io.run(runtime.correlation.update_stage, runtime.cfg.account_id, payload["client_order_id"], "BRIDGE_QUEUED")
                 else:
-                    await run_blocking(runtime.correlation.update_stage, runtime.cfg.account_id, payload["client_order_id"], "REJECTED")
+                    await runtime.db_io.run(runtime.correlation.update_stage, runtime.cfg.account_id, payload["client_order_id"], "REJECTED")
+                    await runtime.remove_pending_response(payload["request_id"])
+                reply["_gateway_effect_state"] = (
+                    "UNKNOWN" if submit_unknown
+                    else "TERMINAL" if failed
+                    else "ENQUEUED"
+                )
                 return reply
             reply = {
                 "type": "EXEC_REPORT",
@@ -2768,7 +4304,7 @@ class BigQmtGatewayProxy:
                     safe_str(data.get("error")).strip()
                     or "QMT returned no stable submission result"
                 ) + "; do not retry automatically"
-            await run_blocking(
+            await runtime.db_io.run(
                 lambda: runtime.correlation.update_stage(
                     runtime.cfg.account_id, payload["client_order_id"], stage,
                     order_id=safe_str(data.get("order_id")),
@@ -2777,8 +4313,78 @@ class BigQmtGatewayProxy:
             reply["stage"] = stage
             reply["trace_id"] = payload.get("trace_id", "")
             reply["qmt_user_order_id"] = payload.get("qmt_user_order_id", "")
+            reply["_gateway_effect_state"] = (
+                "UNKNOWN" if stage == "SUBMIT_UNKNOWN"
+                else "TERMINAL" if stage == "REJECTED"
+                else "ENQUEUED"
+            )
             return reply
         except Exception as exc:
+            known_not_enqueued = (
+                isinstance(exc, IoLaneFull)
+                or safe_str(getattr(exc, "code", "")) == "REQUEST_ID_CONFLICT"
+            ) and not helper_completed
+            if not effect_started or known_not_enqueued:
+                try:
+                    await self._rollback_unstarted_order(runtime, payload)
+                except Exception as rollback_exc:
+                    self.logger.error(
+                        "pre_enqueue_order_rollback_failed account=%s request_id=%s error=%s",
+                        runtime.cfg.account_id,
+                        payload.get("request_id"),
+                        rollback_exc,
+                    )
+                    return {
+                        "protocol_version": 2,
+                        "type": "ASYNC_ORDER" if async_mode else "EXEC_REPORT",
+                        "msg_id": msg_id,
+                        "seq": -1 if async_mode else 0,
+                        "status": "UNKNOWN",
+                        "stage": "SUBMIT_UNKNOWN",
+                        "submit_result": "UNKNOWN",
+                        "code": "GATEWAY_STATE_UNAVAILABLE",
+                        "retryable": False,
+                        "effect_started": False,
+                        "request_id": payload.get("request_id", ""),
+                        "client_order_id": payload.get("client_order_id", ""),
+                        "reject_reason": safe_str(rollback_exc),
+                        "timestamp": now(),
+                        "_gateway_effect_state": "UNKNOWN",
+                    }
+                if isinstance(exc, IoLaneFull):
+                    reply = self.gateway_busy_reply(
+                        runtime,
+                        msg,
+                        "account_file_io" if "-file" in exc.lane_name else "account_db_io",
+                    )
+                elif safe_str(getattr(exc, "code", "")) == "REQUEST_ID_CONFLICT":
+                    reply = self.request_state_reply(
+                        runtime,
+                        msg,
+                        "REQUEST_ID_CONFLICT",
+                    )
+                else:
+                    reply = {
+                        "protocol_version": 2,
+                        "type": "ASYNC_ORDER" if async_mode else "EXEC_REPORT",
+                        "msg_id": msg_id,
+                        "seq": -1 if async_mode else 0,
+                        "status": "REJECTED",
+                        "stage": "REJECTED",
+                        "effect_started": False,
+                        "code": safe_str(
+                            getattr(exc, "code", "HELPER_NOT_READY")
+                        ) or "HELPER_NOT_READY",
+                        "retryable": True,
+                        "request_id": payload.get("request_id", ""),
+                        "client_order_id": payload.get("client_order_id", ""),
+                        "trace_id": payload.get("trace_id", ""),
+                        "reject_reason": safe_str(exc),
+                        "timestamp": now(),
+                    }
+                reply["_gateway_cacheable"] = False
+                reply["_gateway_effect_state"] = "PREPARED"
+                return reply
             runtime.update_status_offline(exc)
             uncertain = effect_started
             fallback_stage = "SUBMIT_UNKNOWN" if uncertain else "REJECTED"
@@ -2789,7 +4395,7 @@ class BigQmtGatewayProxy:
                     % reject_reason
                 )
             try:
-                await run_blocking(
+                await runtime.db_io.run(
                     runtime.correlation.update_stage,
                     runtime.cfg.account_id,
                     payload["client_order_id"],
@@ -2811,6 +4417,7 @@ class BigQmtGatewayProxy:
                     "client_order_id": payload.get("client_order_id", ""),
                     "qmt_status": runtime.qmt_status,
                     "timestamp": now(),
+                    "_gateway_effect_state": "UNKNOWN" if uncertain else "TERMINAL",
                 }
             return {
                 "type": "EXEC_REPORT",
@@ -2830,18 +4437,20 @@ class BigQmtGatewayProxy:
                 "client_order_id": payload.get("client_order_id", ""),
                 "qmt_status": runtime.qmt_status,
                 "timestamp": now(),
+                "_gateway_effect_state": "UNKNOWN" if uncertain else "TERMINAL",
             }
 
     def order_payload(self, runtime: AccountRuntime, msg: Dict[str, Any]) -> Dict[str, Any]:
         symbol = safe_str(msg.get("symbol") or msg.get("stock_code") or msg.get("security"), "").strip()
         side = safe_str(msg.get("side") or "BUY").strip().upper()
         client_order_id = safe_str(msg.get("client_order_id") or "").strip()
-        msg_id = safe_str(msg.get("msg_id") or "").strip()
+        raw_msg_id = safe_str(msg.get("msg_id") or "").strip()
         request_id = first_nonempty_stripped(
             msg.get("request_id"),
             client_order_id,
-            msg_id,
+            raw_msg_id,
         ) or make_request_id("order")
+        msg_id = raw_msg_id or request_id
         qmt_user_order_id = safe_str(msg.get("qmt_user_order_id") or "").strip()
         if not qmt_user_order_id:
             trader_prefix = "".join(
@@ -2887,6 +4496,13 @@ class BigQmtGatewayProxy:
             ).strip(),
             "created_at_ns": safe_int(msg.get("created_at_ns"), int(now() * 1000000000)),
             "gateway_received_at_ns": safe_int(msg.get("_gateway_received_at_ns"), time.time_ns()),
+            "gateway_effect_fingerprint": safe_str(
+                msg.get("_gateway_effect_fingerprint")
+            ),
+            "gateway_enqueue_seq": safe_int(
+                msg.get("_gateway_enqueue_seq"),
+                0,
+            ),
         }
         payload["upstream_intent_hash"] = safe_str(msg.get("intent_hash"))
         payload["intent_hash"] = self.order_intent_key(payload)
@@ -2897,16 +4513,32 @@ class BigQmtGatewayProxy:
             return ""
         canonical = stable_hash({
             "account_id": safe_str(payload.get("account_id")).strip(),
+            "account_type": safe_str(payload.get("account_type")).strip(),
             "stock_code": safe_str(payload.get("symbol") or payload.get("stock_code")).strip().upper(),
             "side": safe_str(payload.get("side")).strip().upper(),
-            "volume": safe_int(payload.get("intent_volume", payload.get("quantity")), 0),
+            "quantity": fixed_decimal(payload.get("quantity")),
+            "intent_volume": fixed_decimal(
+                payload.get("intent_volume", payload.get("quantity"))
+            ),
+            "price": fixed_decimal(payload.get("price")),
             "effective_price": fixed_decimal(payload.get("effective_price", payload.get("price"))),
             "price_type": safe_int(payload.get("price_type"), 0),
+            "order_type": (
+                None
+                if payload.get("order_type") is None
+                else safe_int(payload.get("order_type"), 0)
+            ),
+            "qmt_order_type": safe_int(payload.get("qmt_order_type"), 1101),
+            "quick_trade": safe_int(payload.get("quick_trade"), 2),
             "business_order_type": safe_str(payload.get("business_order_type")).strip().lower(),
             "spread": fixed_decimal(payload.get("spread")),
             "credit_mode": safe_str(payload.get("credit_mode")).strip().lower(),
             "strategy_name": safe_str(payload.get("strategy_name") or "xuanling").strip(),
+            "order_remark": safe_str(payload.get("order_remark")).strip(),
             "trader_name": safe_str(payload.get("trader_name") or payload.get("order_remark")).strip(),
+            "qmt_user_order_id": safe_str(
+                payload.get("qmt_user_order_id")
+            ).strip(),
             "authenticated_trader_key": safe_str(
                 payload.get("authenticated_trader_key")
             ).strip(),
@@ -2922,69 +4554,231 @@ class BigQmtGatewayProxy:
     async def _handle_cancel_payload(self, runtime: AccountRuntime, msg: Dict[str, Any], async_mode: bool, order_sysid: bool) -> Dict[str, Any]:
         msg_id = safe_str(msg.get("msg_id"), "")
         payload = {
-            "request_id": msg_id or make_request_id("cancel"),
+            "request_id": first_nonempty_stripped(
+                msg.get("request_id"),
+                msg_id,
+            ) or make_request_id("cancel"),
             "msg_id": msg_id,
             "account_id": runtime.cfg.account_id,
             "account_type": runtime.cfg.account_type,
             "order_id": "" if order_sysid else safe_str(msg.get("order_id") or ""),
             "order_sysid": safe_str(msg.get("order_sysid") or msg.get("order_id") or "") if order_sysid else safe_str(msg.get("order_sysid") or ""),
             "market": msg.get("market", 0),
+            "gateway_effect_fingerprint": safe_str(
+                msg.get("_gateway_effect_fingerprint")
+            ),
+            "gateway_enqueue_seq": safe_int(
+                msg.get("_gateway_enqueue_seq"),
+                0,
+            ),
         }
+        effect_started = False
+        helper_completed = False
         try:
             await self._ensure_helper_ready(runtime)
-            data = await runtime.helper.cancel_order(payload, wait=not async_mode)
-            submit_status = safe_str(data.get("status") or "queued")
-            failed = submit_status == "failed"
             if async_mode:
-                return {
+                await runtime.commit_pending_response(payload["request_id"], {
+                    "kind": "cancel",
+                    "fingerprint": safe_str(
+                        msg.get("_gateway_effect_fingerprint")
+                    ),
+                    "payload": dict(payload),
+                    "queued_at": now(),
+                    "deadline_at": now() + runtime.cfg.request_timeout_seconds,
+                })
+            await self._begin_effect_dispatch(runtime, msg)
+            effect_started = True
+            data = await runtime.helper.cancel_order(
+                payload,
+                wait=not async_mode,
+                enqueue_done=lambda: runtime.finish_effect_enqueue_turn(msg),
+            )
+            helper_completed = True
+            submit_status = safe_str(data.get("status") or "queued").lower()
+            failed = submit_status == "failed"
+            submit_unknown = submit_status == "submit_unknown"
+            queued_timeout = submit_status == "queued" and bool(data.get("timeout"))
+            if async_mode:
+                response_request_id = safe_str(
+                    data.get("request_id") or payload["request_id"]
+                )
+                if response_request_id != payload["request_id"]:
+                    raise HelperError(
+                        "helper changed cancel request_id",
+                        "HELPER_REQUEST_ID_MISMATCH",
+                    )
+                if failed:
+                    await runtime.remove_pending_response(response_request_id)
+                reply = {
                     "type": "ASYNC_CANCEL",
                     "msg_id": msg_id,
-                    "seq": 0 if not failed else -1,
-                    "status": "SENT" if not failed else "REJECTED",
-                    "request_id": data.get("request_id") or payload["request_id"],
+                    "seq": -1 if failed else 0,
+                    "status": (
+                        "REJECTED" if failed
+                        else "UNKNOWN" if submit_unknown
+                        else "SENT"
+                    ),
+                    "stage": (
+                        "REJECTED" if failed
+                        else "SUBMIT_UNKNOWN" if submit_unknown
+                        else "BRIDGE_QUEUED"
+                    ),
+                    "request_id": response_request_id,
                     "cancel_status": submit_status,
                     "reject_reason": data.get("error", ""),
                     "qmt_status": runtime.qmt_status,
                     "timestamp": now(),
                 }
-            return {
+                if submit_unknown:
+                    reply["submit_result"] = "UNKNOWN"
+                    reply["code"] = "QMT_SUBMIT_RESULT_UNKNOWN"
+                    reply["reject_reason"] = (
+                        safe_str(data.get("error")).strip()
+                        or "QMT returned no stable cancel result"
+                    ) + "; reconcile before retry"
+                reply["_gateway_effect_state"] = (
+                    "UNKNOWN" if submit_unknown
+                    else "TERMINAL" if failed
+                    else "ENQUEUED"
+                )
+                return reply
+            reply = {
                 "type": "EXEC_REPORT",
                 "msg_id": msg_id,
                 "order_id": payload["order_id"],
                 "order_sysid": payload["order_sysid"],
-                "status": "CANCELLED" if not failed else "REJECTED",
-                "cancel_status": "cancel_sent" if not failed else "failed",
+                "status": (
+                    "REJECTED" if failed
+                    else "UNKNOWN" if submit_unknown or queued_timeout
+                    else "CANCEL_SUBMITTED"
+                ),
+                "stage": (
+                    "REJECTED" if failed
+                    else "SUBMIT_UNKNOWN" if submit_unknown or queued_timeout
+                    else "CANCEL_SUBMITTED"
+                ),
+                "cancel_status": (
+                    "failed" if failed
+                    else "unknown" if submit_unknown or queued_timeout
+                    else "cancel_sent"
+                ),
                 "submit_status": submit_status,
                 "final": False,
                 "reject_reason": data.get("error", ""),
                 "qmt_status": runtime.qmt_status,
                 "timestamp": now(),
             }
+            if submit_unknown or queued_timeout:
+                reply["submit_result"] = "UNKNOWN"
+                reply["code"] = (
+                    "HELPER_RESPONSE_TIMEOUT" if queued_timeout
+                    else "QMT_SUBMIT_RESULT_UNKNOWN"
+                )
+                reply["reject_reason"] = (
+                    "helper cancel response not observed; reconcile before retry"
+                    if queued_timeout
+                    else (
+                        safe_str(data.get("error")).strip()
+                        or "QMT returned no stable cancel result"
+                    ) + "; reconcile before retry"
+                )
+            reply["_gateway_effect_state"] = (
+                "UNKNOWN" if submit_unknown or queued_timeout
+                else "TERMINAL" if failed
+                else "ENQUEUED"
+            )
+            return reply
         except Exception as exc:
+            known_not_enqueued = (
+                isinstance(exc, IoLaneFull)
+                or safe_str(getattr(exc, "code", "")) == "REQUEST_ID_CONFLICT"
+            ) and not helper_completed
+            if not effect_started or known_not_enqueued:
+                try:
+                    await self._rollback_unstarted_cancel(runtime, payload)
+                except Exception as rollback_exc:
+                    self.logger.error(
+                        "pre_enqueue_cancel_rollback_failed account=%s request_id=%s error=%s",
+                        runtime.cfg.account_id,
+                        payload.get("request_id"),
+                        rollback_exc,
+                    )
+                    return {
+                        "type": "ASYNC_CANCEL" if async_mode else "EXEC_REPORT",
+                        "msg_id": msg_id,
+                        "seq": -1 if async_mode else 0,
+                        "status": "UNKNOWN",
+                        "stage": "SUBMIT_UNKNOWN",
+                        "submit_result": "UNKNOWN",
+                        "effect_started": False,
+                        "code": "GATEWAY_STATE_UNAVAILABLE",
+                        "retryable": False,
+                        "request_id": payload.get("request_id", ""),
+                        "reject_reason": safe_str(rollback_exc),
+                        "timestamp": now(),
+                        "_gateway_effect_state": "UNKNOWN",
+                    }
+                if isinstance(exc, IoLaneFull):
+                    reply = self.gateway_busy_reply(
+                        runtime,
+                        msg,
+                        "account_file_io" if "-file" in exc.lane_name else "account_db_io",
+                    )
+                elif safe_str(getattr(exc, "code", "")) == "REQUEST_ID_CONFLICT":
+                    reply = self.request_state_reply(
+                        runtime,
+                        msg,
+                        "REQUEST_ID_CONFLICT",
+                    )
+                else:
+                    reply = {
+                        "type": "ASYNC_CANCEL" if async_mode else "EXEC_REPORT",
+                        "msg_id": msg_id,
+                        "seq": -1 if async_mode else 0,
+                        "status": "REJECTED",
+                        "stage": "REJECTED",
+                        "effect_started": False,
+                        "code": safe_str(getattr(exc, "code", "HELPER_NOT_READY")),
+                        "retryable": True,
+                        "request_id": payload.get("request_id", ""),
+                        "reject_reason": safe_str(exc),
+                        "timestamp": now(),
+                    }
+                reply["_gateway_cacheable"] = False
+                reply["_gateway_effect_state"] = "PREPARED"
+                return reply
             runtime.update_status_offline(exc)
             if async_mode:
                 return {
                     "type": "ASYNC_CANCEL",
                     "msg_id": msg_id,
                     "seq": -1,
-                    "status": "REJECTED",
-                    "code": safe_str(getattr(exc, "code", "HELPER_NOT_READY")),
-                    "reject_reason": safe_str(exc),
+                    "status": "UNKNOWN",
+                    "stage": "SUBMIT_UNKNOWN",
+                    "submit_result": "UNKNOWN",
+                    "code": "POST_ENQUEUE_STATE_UNCERTAIN",
+                    "effect_started": True,
+                    "reject_reason": "%s; cancel state unknown; reconcile before retry" % safe_str(exc),
                     "qmt_status": runtime.qmt_status,
                     "timestamp": now(),
+                    "_gateway_effect_state": "UNKNOWN",
                 }
             return {
                 "type": "EXEC_REPORT",
                 "msg_id": msg_id,
                 "order_id": payload["order_id"],
                 "order_sysid": payload["order_sysid"],
-                "status": "REJECTED",
-                "cancel_status": "failed",
+                "status": "UNKNOWN",
+                "stage": "SUBMIT_UNKNOWN",
+                "submit_result": "UNKNOWN",
+                "cancel_status": "unknown",
                 "final": False,
-                "code": safe_str(getattr(exc, "code", "HELPER_NOT_READY")),
-                "reject_reason": safe_str(exc),
+                "code": "POST_ENQUEUE_STATE_UNCERTAIN",
+                "effect_started": True,
+                "reject_reason": "%s; cancel state unknown; reconcile before retry" % safe_str(exc),
                 "qmt_status": runtime.qmt_status,
                 "timestamp": now(),
+                "_gateway_effect_state": "UNKNOWN",
             }
 
     async def handle_fund_transfer(self, runtime: AccountRuntime, msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -3066,10 +4860,14 @@ class BigQmtGatewayProxy:
         outbound = dict(msg)
         outbound["delivery_id"] = delivery_id
         waiter = asyncio.Event()
+        async with runtime.clients_lock:
+            target = runtime.primary
+            if target is None or target.closed:
+                return False
         async with runtime.delivery_lock:
-            runtime.delivery_waiters[delivery_id] = waiter
+            runtime.delivery_waiters[delivery_id] = (target, waiter)
         try:
-            if not await self.broadcast(runtime, outbound):
+            if not await target.send(outbound):
                 return False
             try:
                 await asyncio.wait_for(waiter.wait(), timeout=max(0.05, timeout))
@@ -3078,7 +4876,8 @@ class BigQmtGatewayProxy:
                 return False
         finally:
             async with runtime.delivery_lock:
-                if runtime.delivery_waiters.get(delivery_id) is waiter:
+                record = runtime.delivery_waiters.get(delivery_id)
+                if record is not None and record[1] is waiter:
                     runtime.delivery_waiters.pop(delivery_id, None)
 
     async def response_watcher_loop(self, runtime: AccountRuntime) -> None:
@@ -3087,10 +4886,6 @@ class BigQmtGatewayProxy:
             try:
                 async with runtime.clients_lock:
                     has_client = runtime.primary is not None and not runtime.primary.closed
-                if not has_client:
-                    await asyncio.sleep(interval)
-                    continue
-
                 async with runtime.pending_lock:
                     pending = dict(runtime.pending_responses)
                 active_request_ids = set(runtime.response_delivery_tasks)
@@ -3104,23 +4899,44 @@ class BigQmtGatewayProxy:
                     for request_id, item in pending.items()
                     if request_id not in active_request_ids
                 }
+                ready_candidates = {
+                    request_id: item
+                    for request_id, item in candidates.items()
+                    if isinstance(item.get("ready_response"), dict)
+                }
+                scan_candidates = {
+                    request_id: item
+                    for request_id, item in candidates.items()
+                    if request_id not in ready_candidates
+                }
                 responses: Dict[str, Dict[str, Any]] = {}
                 observed_request_ids: Set[str] = set()
                 timeout_check_ids: List[str] = []
                 scan_complete = True
-                if candidates and available_slots:
+                if has_client:
+                    for request_id, item in ready_candidates.items():
+                        if available_slots <= 0:
+                            break
+                        if self._start_response_delivery_task(
+                            runtime,
+                            request_id,
+                            item,
+                            dict(item["ready_response"]),
+                        ):
+                            available_slots -= 1
+                if scan_candidates and available_slots:
                     responses, observed_request_ids, scan_complete = (
                         await runtime.helper.read_available_responses(
-                            set(candidates),
+                            set(scan_candidates),
                             MAX_RESPONSE_SCAN_ENTRIES_PER_TICK,
                             available_slots,
                         )
                     )
                     if scan_complete:
-                        timeout_check_ids = list(candidates)
+                        timeout_check_ids = list(scan_candidates)
                     else:
                         fallback_ids = runtime.next_response_fallback_ids(
-                            list(candidates),
+                            list(scan_candidates),
                             MAX_RESPONSE_FALLBACK_CHECKS_PER_TICK,
                         )
                         targeted_responses, targeted_observed = (
@@ -3147,14 +4963,14 @@ class BigQmtGatewayProxy:
                     ):
                         available_slots -= 1
 
-                if timeout_check_ids and available_slots:
+                if has_client and timeout_check_ids and available_slots:
                     now_ts = now()
                     for request_id in timeout_check_ids:
                         if available_slots <= 0:
                             break
                         if request_id in observed_request_ids:
                             continue
-                        item = candidates.get(request_id)
+                        item = scan_candidates.get(request_id)
                         if item is None:
                             continue
                         if now_ts < safe_float(item.get("deadline_at"), now_ts + 1):
@@ -3166,12 +4982,32 @@ class BigQmtGatewayProxy:
                             {},
                         ):
                             available_slots -= 1
-                await asyncio.sleep(interval)
+                # Even an incomplete prefix scan waits for the bounded polling
+                # interval. The rotating targeted fallback above still makes
+                # progress, while orphan-heavy directories cannot spin at 0ms.
+                await self._wait_directory_hint(
+                    runtime.response_change_watcher,
+                    interval,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.logger.warning("response_watcher_failed account=%s error=%s", runtime.cfg.account_id, exc)
                 await asyncio.sleep(min(1.0, interval * 10))
+
+    @staticmethod
+    async def _wait_directory_hint(
+        watcher: Optional[WindowsDirectoryWatcher],
+        timeout: float,
+    ) -> None:
+        if watcher is None:
+            await asyncio.sleep(timeout)
+            return
+        reason = await watcher.wait(timeout)
+        if reason == WakeReason.CLOSED:
+            # A permanently closed watcher otherwise returns immediately and
+            # would turn the polling fallback into a busy loop.
+            await asyncio.sleep(timeout)
 
     def _start_response_delivery_task(
         self,
@@ -3226,22 +5062,112 @@ class BigQmtGatewayProxy:
         item: Dict[str, Any],
         response: Dict[str, Any],
     ) -> None:
+        response_kind = safe_str(item.get("kind") or "order").lower()
         if response:
-            delivered = await self._emit_async_response(runtime, request_id, item, response)
-            if delivered:
+            expected_fingerprint = safe_str(item.get("fingerprint")).strip()
+            response_fingerprint = safe_str(
+                response.get("gateway_effect_fingerprint")
+            ).strip()
+            response_request_id = safe_str(response.get("request_id")).strip()
+            if expected_fingerprint and (
+                response_fingerprint != expected_fingerprint
+                or response_request_id != request_id
+            ):
+                self.logger.error(
+                    "helper_response_identity_mismatch account=%s request_id=%s",
+                    runtime.cfg.account_id,
+                    request_id,
+                )
+                response = {
+                    "version": 1,
+                    "ok": False,
+                    "request_id": request_id,
+                    "account_id": runtime.cfg.account_id,
+                    "action": (
+                        "cancel_order" if response_kind == "cancel"
+                        else "place_order"
+                    ),
+                    "gateway_effect_fingerprint": expected_fingerprint,
+                    "data": {
+                        "status": "submit_unknown",
+                        "stage": "SUBMIT_UNKNOWN",
+                    },
+                    "code": "HELPER_RESPONSE_IDENTITY_MISMATCH",
+                    "error": (
+                        "Helper response identity does not match the durable request; reconcile before retry"
+                    ),
+                }
+            if not item.get("response_captured"):
+                captured_item = dict(item)
+                captured_item["ready_response"] = dict(response)
+                captured_item["response_captured"] = True
+                captured_item["response_captured_at"] = now()
+                # SQLite becomes the durable inbox before the Helper response
+                # file is acknowledged.  A strategy process may therefore be
+                # offline for longer than Helper file retention without losing
+                # its final result.
+                await runtime.commit_pending_response(
+                    request_id,
+                    captured_item,
+                )
                 await runtime.helper.ack_response(request_id)
-                async with runtime.pending_lock:
-                    runtime.pending_responses.pop(request_id, None)
+                item = captured_item
+            if response_kind == "cancel":
+                delivered, final_reply, final_stage = await self._emit_async_cancel_response(
+                    runtime, request_id, item, response,
+                )
+            else:
+                delivered, final_reply, final_stage = await self._emit_async_response(
+                    runtime, request_id, item, response,
+                )
+            if delivered:
+                effect_state = (
+                    "UNKNOWN" if final_stage == "SUBMIT_UNKNOWN"
+                    else "TERMINAL" if final_stage == "REJECTED"
+                    else "ENQUEUED"
+                )
+                transitioned = await runtime.transition_effect_request(
+                    request_id,
+                    safe_str(item.get("fingerprint")),
+                    effect_state,
+                    final_reply,
+                    allowed_from=("DISPATCHING", "ENQUEUED", "UNKNOWN"),
+                )
+                if not transitioned:
+                    raise RuntimeError(
+                        "could not persist final effect response before acknowledgement"
+                    )
+                final_payload = (
+                    item.get("payload")
+                    if isinstance(item.get("payload"), dict)
+                    else {}
+                )
+                runtime.remember(
+                    safe_str(final_payload.get("msg_id")),
+                    final_reply,
+                    safe_str(item.get("fingerprint")),
+                )
+                # TCP DELIVERY_ACK has already been observed. Remove the
+                # durable recovery row before unlinking the only response
+                # file, so a database failure remains safely retryable.
+                await runtime.delete_pending_response_record(request_id)
+                if not item.get("response_captured"):
+                    await runtime.helper.ack_response(request_id)
+                await runtime.forget_pending_response(request_id)
             return
         now_ts = now()
         if now_ts < safe_float(item.get("deadline_at"), now_ts + 1):
             return
         if item.get("timeout_notified"):
-            async with runtime.pending_lock:
-                runtime.pending_responses.pop(request_id, None)
+            await runtime.remove_pending_response(request_id)
             return
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        msg = self._async_response_message(runtime, payload, {}, "SUBMIT_UNKNOWN")
+        if response_kind == "cancel":
+            msg = self._async_cancel_response_message(
+                runtime, payload, {}, "SUBMIT_UNKNOWN",
+            )
+        else:
+            msg = self._async_response_message(runtime, payload, {}, "SUBMIT_UNKNOWN")
         msg["code"] = "HELPER_RESPONSE_TIMEOUT"
         msg["reject_reason"] = "helper response not observed; do not retry automatically"
         delivered = await self.broadcast_confirmed(
@@ -3250,14 +5176,32 @@ class BigQmtGatewayProxy:
             "response:%s:SUBMIT_UNKNOWN" % request_id,
         )
         if delivered:
-            await run_blocking(
-                runtime.correlation.update_stage,
-                runtime.cfg.account_id,
-                safe_str(payload.get("client_order_id")),
-                "SUBMIT_UNKNOWN",
+            transitioned = await runtime.transition_effect_request(
+                request_id,
+                safe_str(item.get("fingerprint")),
+                "UNKNOWN",
+                msg,
+                allowed_from=("DISPATCHING", "ENQUEUED", "UNKNOWN"),
             )
+            if not transitioned:
+                raise RuntimeError(
+                    "could not persist timeout effect response before acknowledgement"
+                )
+            runtime.remember(
+                safe_str(payload.get("msg_id")),
+                msg,
+                safe_str(item.get("fingerprint")),
+            )
+            if response_kind != "cancel":
+                await runtime.db_io.run(
+                    runtime.correlation.update_stage,
+                    runtime.cfg.account_id,
+                    safe_str(payload.get("client_order_id")),
+                    "SUBMIT_UNKNOWN",
+                )
             item["timeout_notified"] = True
             item["deadline_at"] = now_ts + 300.0
+            await runtime.commit_pending_response(request_id, item)
 
     def _async_response_message(
         self,
@@ -3288,20 +5232,102 @@ class BigQmtGatewayProxy:
             "timestamp": now(),
         }
 
+    def _async_cancel_response_message(
+        self,
+        runtime: AccountRuntime,
+        payload: Dict[str, Any],
+        data: Dict[str, Any],
+        stage: str,
+    ) -> Dict[str, Any]:
+        return {
+            "protocol_version": 2,
+            "type": "ASYNC_CANCEL_RESPONSE",
+            "stage": stage,
+            "status": (
+                "REJECTED" if stage == "REJECTED"
+                else "UNKNOWN" if stage == "SUBMIT_UNKNOWN"
+                else "SENT"
+            ),
+            "msg_id": safe_str(payload.get("msg_id")),
+            "request_id": safe_str(payload.get("request_id")),
+            "account_id": runtime.cfg.account_id,
+            "order_id": safe_str(payload.get("order_id") or data.get("order_id")),
+            "order_sysid": safe_str(
+                payload.get("order_sysid") or data.get("order_sysid")
+            ),
+            "cancel_status": safe_str(data.get("status") or stage.lower()),
+            "final": False,
+            "timestamp": now(),
+        }
+
+    async def _emit_async_cancel_response(
+        self,
+        runtime: AccountRuntime,
+        request_id: str,
+        item: Dict[str, Any],
+        response: Dict[str, Any],
+    ) -> tuple[bool, Dict[str, Any], str]:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        data = response.get("data") if isinstance(response.get("data"), dict) else {}
+        submit_status = safe_str(data.get("status")).lower()
+        submit_unknown = (
+            submit_status == "submit_unknown"
+            or safe_str(response.get("code"))
+            in {"HELPER_RESPONSE_IDENTITY_MISMATCH", "RECONCILE_REQUIRED"}
+        )
+        failed = not submit_unknown and (
+            response.get("ok") is False or submit_status == "failed"
+        )
+        stage = (
+            "REJECTED" if failed
+            else "SUBMIT_UNKNOWN" if submit_unknown
+            else "CANCEL_SUBMITTED"
+        )
+        msg = self._async_cancel_response_message(runtime, payload, data, stage)
+        if failed:
+            msg["code"] = safe_str(
+                response.get("code") or data.get("code") or "QMT_ERROR"
+            )
+            msg["reject_reason"] = safe_str(
+                response.get("error") or data.get("error")
+            )
+        elif stage == "SUBMIT_UNKNOWN":
+            msg["code"] = safe_str(
+                response.get("code") or "QMT_SUBMIT_RESULT_UNKNOWN"
+            )
+            msg["reject_reason"] = (
+                safe_str(response.get("error")).strip()
+                or "QMT returned no stable cancel result; do not retry automatically"
+            )
+            msg["reconcile_required"] = True
+        delivered = await self.broadcast_confirmed(
+            runtime,
+            msg,
+            "response:%s:%s" % (request_id, stage),
+        )
+        return delivered, msg, stage
+
     async def _emit_async_response(
         self,
         runtime: AccountRuntime,
         request_id: str,
         item: Dict[str, Any],
         response: Dict[str, Any],
-    ) -> bool:
+    ) -> tuple[bool, Dict[str, Any], str]:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         data = response.get("data") if isinstance(response.get("data"), dict) else {}
         submit_status = safe_str(data.get("status")).lower()
-        failed = response.get("ok") is False or submit_status == "failed"
+        submit_unknown = (
+            submit_status == "submit_unknown"
+            or safe_str(response.get("code"))
+            in {"HELPER_RESPONSE_IDENTITY_MISMATCH", "RECONCILE_REQUIRED"}
+        )
+        failed = not submit_unknown and (
+            response.get("ok") is False or submit_status == "failed"
+        )
         stage = (
             "REJECTED" if failed
-            else "SUBMIT_UNKNOWN" if submit_status == "submit_unknown"
+            else "SUBMIT_UNKNOWN" if submit_unknown
             else "QMT_SUBMITTED"
         )
         msg = self._async_response_message(runtime, payload, data, stage)
@@ -3311,21 +5337,27 @@ class BigQmtGatewayProxy:
             msg["code"] = safe_str(response.get("code") or data.get("code") or "QMT_ERROR")
             msg["reject_reason"] = safe_str(response.get("error") or data.get("error"))
         elif stage == "SUBMIT_UNKNOWN":
-            msg["code"] = "QMT_SUBMIT_RESULT_UNKNOWN"
-            msg["reject_reason"] = "QMT returned no stable order id; do not retry automatically"
+            msg["code"] = safe_str(
+                response.get("code") or "QMT_SUBMIT_RESULT_UNKNOWN"
+            )
+            msg["reject_reason"] = (
+                safe_str(response.get("error")).strip()
+                or "QMT returned no stable order id; do not retry automatically"
+            )
+            msg["reconcile_required"] = True
         delivered = await self.broadcast_confirmed(
             runtime,
             msg,
             "response:%s:%s" % (request_id, stage),
         )
         if delivered:
-            await run_blocking(
+            await runtime.db_io.run(
                 lambda: runtime.correlation.update_stage(
                     runtime.cfg.account_id, safe_str(payload.get("client_order_id")), stage,
                     order_id=safe_str(data.get("order_id")),
                 )
             )
-        return delivered
+        return delivered, msg, stage
 
     async def live_event_watcher_loop(self, runtime: AccountRuntime) -> None:
         interval = max(0.005, runtime.cfg.event_watch_interval_seconds)
@@ -3334,19 +5366,126 @@ class BigQmtGatewayProxy:
                 async with runtime.clients_lock:
                     has_client = runtime.primary is not None and not runtime.primary.closed
                 if not has_client:
-                    await asyncio.sleep(interval)
+                    await self._wait_directory_hint(
+                        runtime.event_change_watcher,
+                        interval,
+                    )
                     continue
                 events = await runtime.helper.read_events(100)
                 if events:
-                    await asyncio.gather(*(
-                        self._deliver_live_event(runtime, event) for event in events
-                    ), return_exceptions=True)
-                await asyncio.sleep(interval if not events else 0)
+                    await self._deliver_live_event_batch(runtime, events)
+                if events:
+                    await asyncio.sleep(0)
+                else:
+                    await self._wait_directory_hint(
+                        runtime.event_change_watcher,
+                        interval,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.logger.warning("live_event_watcher_failed account=%s error=%s", runtime.cfg.account_id, exc)
                 await asyncio.sleep(min(1.0, interval * 10))
+
+    async def _deliver_live_event_batch(
+        self,
+        runtime: AccountRuntime,
+        events: List[Dict[str, Any]],
+    ) -> None:
+        """Deliver, persist dedupe ids in one transaction, then ack files."""
+        events = sorted(
+            events,
+            key=lambda event: (
+                safe_int(event.get("event_seq"), 0),
+                safe_str(event.get("event_id")),
+            ),
+        )
+        unique_events: List[Dict[str, Any]] = []
+        duplicate_events: List[Dict[str, Any]] = []
+        batch_ids: Set[str] = set()
+        lookup_ids: List[str] = []
+        for event in events:
+            event_id = safe_str(event.get("event_id"))
+            if event_id and (
+                event_id in runtime.seen_event_ids or event_id in batch_ids
+            ):
+                duplicate_events.append(event)
+                continue
+            unique_events.append(event)
+            if event_id:
+                batch_ids.add(event_id)
+                lookup_ids.append(event_id)
+
+        persisted_ids: Set[str] = set()
+        if lookup_ids:
+            persisted_ids = await runtime.db_io.run(
+                runtime.correlation.events_seen_many,
+                runtime.cfg.account_id,
+                lookup_ids,
+            )
+        deliver_events = []
+        for event in unique_events:
+            if safe_str(event.get("event_id")) in persisted_ids:
+                duplicate_events.append(event)
+            else:
+                deliver_events.append(event)
+
+        # Already committed events can be removed without another TCP send.
+        if duplicate_events:
+            duplicate_ack_results = await asyncio.gather(*(
+                runtime.helper.ack_event(event) for event in duplicate_events
+            ), return_exceptions=True)
+            for event, result in zip(duplicate_events, duplicate_ack_results):
+                if isinstance(result, BaseException):
+                    await self._retry_live_event(runtime, event, result)
+
+        delivered_events: List[Dict[str, Any]] = []
+        for event in deliver_events:
+            try:
+                await self.emit_event(
+                    runtime,
+                    event,
+                    persist_event=False,
+                    dedupe_prechecked=True,
+                )
+                delivered_events.append(event)
+            except Exception as exc:
+                await self._retry_live_event(runtime, event, exc)
+                # Preserve callback order on the failure path as well.  The
+                # remaining files stay claimed in events/processing and are
+                # selected again after the failed earlier event is retried.
+                break
+        if not delivered_events:
+            return
+
+        delivered_ids = [
+            safe_str(event.get("event_id"))
+            for event in delivered_events
+            if safe_str(event.get("event_id"))
+        ]
+        try:
+            if delivered_ids:
+                await runtime.db_io.run(
+                    runtime.correlation.mark_events,
+                    runtime.cfg.account_id,
+                    delivered_ids,
+                )
+                runtime.seen_event_ids.update(delivered_ids)
+        except Exception as exc:
+            # Files stay durable and will be retried. Delivery IDs let a
+            # conforming client suppress the possible replay.
+            for event in delivered_events:
+                await self._retry_live_event(runtime, event, exc)
+            return
+
+        ack_results = await asyncio.gather(*(
+            runtime.helper.ack_event(event) for event in delivered_events
+        ), return_exceptions=True)
+        for event, result in zip(delivered_events, ack_results):
+            if isinstance(result, BaseException):
+                await self._retry_live_event(runtime, event, result)
+        if len(runtime.seen_event_ids) > 20000:
+            runtime.seen_event_ids.clear()
 
     async def _deliver_live_event(self, runtime: AccountRuntime, event: Dict[str, Any]) -> None:
         try:
@@ -3375,23 +5514,99 @@ class BigQmtGatewayProxy:
                     "timestamp": now(),
                 })
 
+    async def _retry_live_event(
+        self,
+        runtime: AccountRuntime,
+        event: Dict[str, Any],
+        exc: Any,
+    ) -> None:
+        exhausted = await runtime.helper.retry_event(event)
+        self.logger.warning(
+            "live_event_delivery_failed account=%s event_id=%s error=%s",
+            runtime.cfg.account_id,
+            event.get("event_id"),
+            exc,
+        )
+        if exhausted:
+            runtime.qmt_status = {
+                **runtime.qmt_status,
+                "state": "delivery_degraded",
+                "ready": False,
+                "last_error": "live event delivery exhausted; reconcile required",
+                "updated_at": now(),
+            }
+            await self.broadcast(runtime, {
+                "protocol_version": 2,
+                "type": "RECONCILE_REQUIRED",
+                "account_id": runtime.cfg.account_id,
+                "reason": "live_event_delivery_exhausted",
+                "event_id": safe_str(event.get("event_id")),
+                "timestamp": now(),
+            })
+
     async def maintenance_loop(self, runtime: AccountRuntime) -> None:
         interval = max(10.0, runtime.cfg.maintenance_interval_seconds)
         while self.running:
             await asyncio.sleep(interval)
             try:
                 cutoff = now() - 86400.0
-                await run_blocking(self._cleanup_runtime_files, runtime, cutoff)
+                await runtime.file_io.run(self._cleanup_runtime_files, runtime, cutoff)
+                if runtime.effect_inflight == 0 and runtime.db_io.pending == 0:
+                    await runtime.db_io.run(
+                        self._maintain_correlation_store,
+                        runtime,
+                        now() - (8 * 86400.0),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.logger.warning("maintenance_failed account=%s error=%s", runtime.cfg.account_id, exc)
 
     @staticmethod
+    def _maintain_correlation_store(
+        runtime: AccountRuntime,
+        completed_cutoff: float,
+    ) -> Dict[str, Any]:
+        cleaned = runtime.correlation.cleanup_completed(
+            completed_cutoff,
+            event_limit=1000,
+            # Never automatically release a historical client_order_id.
+            # Order-correlation pruning is an explicit operator decision.
+            order_limit=0,
+        )
+        cleaned["wal"] = runtime.correlation.checkpoint_wal()
+        return cleaned
+
+    @staticmethod
     def _cleanup_runtime_files(runtime: AccountRuntime, cutoff: float) -> None:
-        pending = set(runtime.pending_responses.keys())
+        pending = {
+            request_file_key(request_id)
+            for request_id in runtime.pending_responses
+        }
+        pending.update(
+            safe_filename(request_id)
+            for request_id in runtime.pending_responses
+        )
         remaining = 200
-        for folder in (runtime.helper.responses, runtime.helper.events_failed, runtime.helper.done):
+        json_cleanup_folders = {
+            runtime.helper.responses,
+            runtime.helper.events_failed,
+            runtime.helper.done,
+        }
+        folders = (
+            runtime.helper.commands,
+            runtime.helper.queries,
+            runtime.helper.processing_commands,
+            runtime.helper.processing_queries,
+            runtime.helper.responses,
+            runtime.helper.request_state,
+            runtime.helper.events_live,
+            runtime.helper.events_processing,
+            runtime.helper.events_failed,
+            runtime.helper.done,
+            runtime.helper.snapshots,
+        )
+        for folder in folders:
             entries = None
             try:
                 entries = os.scandir(str(folder))
@@ -3403,7 +5618,13 @@ class BigQmtGatewayProxy:
                     scanned += 1
                     if scanned > max(64, remaining * 4):
                         break
-                    if not entry.name.endswith(".json") or Path(entry.name).stem in pending:
+                    is_tmp = entry.name.endswith(".tmp")
+                    is_cleanup_json = (
+                        folder in json_cleanup_folders
+                        and entry.name.endswith(".json")
+                        and Path(entry.name).stem not in pending
+                    )
+                    if not is_tmp and not is_cleanup_json:
                         continue
                     try:
                         if entry.is_file() and entry.stat().st_mtime < cutoff:
@@ -3422,9 +5643,12 @@ class BigQmtGatewayProxy:
     async def poll_account_loop(self, runtime: AccountRuntime) -> None:
         while self.running:
             try:
-                health = await runtime.helper.health()
-                runtime.update_status_ready(health)
-                if not health.get("ready"):
+                health, cache_age = await runtime.helper_health_snapshot()
+                cache_fresh = (
+                    bool(health)
+                    and cache_age <= HELPER_HEALTH_CACHE_MAX_AGE_SECONDS
+                )
+                if not cache_fresh or not health.get("ready"):
                     await self.broadcast_status(runtime)
                     await asyncio.sleep(runtime.next_poll_delay(False))
                     continue
@@ -3455,14 +5679,31 @@ class BigQmtGatewayProxy:
             "timestamp": now(),
         })
 
-    async def emit_event(self, runtime: AccountRuntime, event: Dict[str, Any]) -> bool:
+    async def emit_event(
+        self,
+        runtime: AccountRuntime,
+        event: Dict[str, Any],
+        persist_event: bool = True,
+        dedupe_prechecked: bool = False,
+    ) -> bool:
         event_type = safe_str(event.get("type"), "")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if not event_type:
             return True
         event_id = safe_str(event.get("event_id"))
+        if not event_id:
+            raise ValueError(
+                "reliable Helper event_id is required for durable dedupe"
+            )
         if event_id:
-            if event_id in runtime.seen_event_ids or await run_blocking(runtime.correlation.event_seen, runtime.cfg.account_id, event_id):
+            if event_id in runtime.seen_event_ids or (
+                not dedupe_prechecked
+                and await runtime.db_io.run(
+                    runtime.correlation.event_seen,
+                    runtime.cfg.account_id,
+                    event_id,
+                )
+            ):
                 return True
         trade_key = ""
         order_version = ""
@@ -3476,7 +5717,7 @@ class BigQmtGatewayProxy:
                 return True
         correlation = runtime.resolve_order_correlation(data)
         if correlation is None:
-            correlation = await run_blocking(
+            correlation = await runtime.db_io.run(
                 runtime.correlation.resolve, runtime.cfg.account_id, data,
             )
             if correlation:
@@ -3485,7 +5726,7 @@ class BigQmtGatewayProxy:
             data = runtime._apply_persisted_order_correlation(dict(data), correlation)
             stage = self._stage_for_event(event_type, data)
             if stage:
-                await run_blocking(
+                await runtime.db_io.run(
                     lambda: runtime.correlation.update_stage(
                         runtime.cfg.account_id, safe_str(correlation.get("client_order_id")), stage,
                         order_id=safe_str(data.get("order_id")),
@@ -3529,9 +5770,9 @@ class BigQmtGatewayProxy:
         )
         if not delivered:
             raise ConnectionError("live event has no active TCP recipient")
-        if event_id:
+        if event_id and persist_event:
             runtime.seen_event_ids.add(event_id)
-            await run_blocking(runtime.correlation.mark_event, runtime.cfg.account_id, event_id)
+            await runtime.db_io.run(runtime.correlation.mark_event, runtime.cfg.account_id, event_id)
         if trade_key:
             runtime.seen_trade_keys.add(trade_key)
         if order_version:
@@ -3819,8 +6060,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         except (NotImplementedError, RuntimeError):
             pass
 
-    await proxy.start()
     try:
+        await proxy.start()
         await stop_event.wait()
     finally:
         await proxy.stop()

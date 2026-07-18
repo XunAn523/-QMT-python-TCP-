@@ -82,6 +82,10 @@ class GeneratorTest(unittest.TestCase):
             self.assertEqual(manifest["accounts"][0]["helper_sha256"], digest)
             self.assertIn(('EXPECTED_SHA256 = "%s"' % digest).encode("ascii"), loader_data)
             self.assertEqual(manifest["build_id"], generator.EXPECTED_BUILD_ID)
+            self.assertEqual(
+                generator.EXPECTED_BUILD_ID,
+                "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v12_fail_closed_sibling_scan",
+            )
             helper_source = helper_data.decode("ascii")
             config_block = helper_source.split(
                 "# XUANLING_HELPER_CONFIG_END", 1
@@ -92,7 +96,23 @@ class GeneratorTest(unittest.TestCase):
             self.assertIn("COMMAND_INTERVAL_MS = 25", config_block)
             self.assertIn("QUERY_INTERVAL_MS = 500", config_block)
             self.assertIn("COMMAND_BUDGET_MS = 15.0", config_block)
+            self.assertIn(
+                "MAX_REQUEST_QUEUE_SCAN_ENTRIES_PER_CYCLE = 512",
+                helper_source,
+            )
             self.assertIn("ENABLE_TRADING = False", config_block)
+            self.assertIn("def _request_file_key(request_id):", helper_source)
+            generated_namespace = {}
+            exec(
+                compile(helper_source, "generated-helper.py", "exec"),
+                generated_namespace,
+                generated_namespace,
+            )
+            request_id = "\u8ba2\u5355/114514"
+            self.assertEqual(
+                generated_namespace["_request_file_key"](request_id),
+                hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
+            )
 
     def test_03_loader_exports_callbacks_and_rejects_tampering(self):
         with tempfile.TemporaryDirectory(prefix="qmt-local-loader-") as tmp:

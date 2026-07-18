@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--quantity", type=int, required=True)
     parser.add_argument("--price", type=float, required=True)
     parser.add_argument("--client-order-id", required=True, help="stable business idempotency key")
+    parser.add_argument("--request-id", default="", help="stable effect id for an explicitly safe same-key retry")
     parser.add_argument("--strategy-name", default="external_strategy")
     parser.add_argument("--order-remark", default="")
     parser.add_argument("--trace-id", default="")
@@ -50,6 +51,7 @@ def main() -> int:
         args.quantity,
         args.price,
         client_order_id=args.client_order_id,
+        request_id=args.request_id,
         strategy_name=args.strategy_name,
         order_remark=args.order_remark,
         trace_id=args.trace_id,
@@ -98,6 +100,7 @@ def main() -> int:
             args.quantity,
             args.price,
             client_order_id=args.client_order_id,
+            request_id=args.request_id,
             strategy_name=args.strategy_name,
             order_remark=args.order_remark,
             trace_id=args.trace_id,

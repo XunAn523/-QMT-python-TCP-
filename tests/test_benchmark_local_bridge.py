@@ -38,9 +38,37 @@ class OfflineBenchmarkTest(unittest.TestCase):
         summary = result["summary"]
 
         self.assertEqual(len(records), 6)
+        self.assertEqual(benchmark.SCHEMA_VERSION, 2)
+        self.assertTrue(all(record["schema_version"] == 2 for record in records))
         self.assertTrue(all(record["record_type"] == "sample" for record in records))
         self.assertTrue(all(record["ok"] for record in records))
+        self.assertTrue(
+            all(record["intent_hash"].startswith("sha256:") for record in records)
+        )
+        self.assertTrue(
+            all(
+                record["gateway_effect_fingerprint"].startswith("sha256:")
+                for record in records
+            )
+        )
+        self.assertTrue(all(record["effect_kind"] == "order" for record in records))
+        self.assertTrue(
+            all(record["effect_state"] == "ENQUEUED" for record in records)
+        )
+        self.assertTrue(
+            all(
+                record["effect_result_stage"] == "BRIDGE_QUEUED"
+                for record in records
+            )
+        )
+        self.assertTrue(
+            all(record["effect_registry_duplicate_replayed"] for record in records)
+        )
+        self.assertTrue(
+            all(record["effect_registry_record_valid"] for record in records)
+        )
         self.assertEqual(summary["record_type"], "summary")
+        self.assertEqual(summary["schema_version"], 2)
         self.assertEqual(summary["errors"], 0)
         self.assertEqual(summary["sample_records"], 6)
         self.assertEqual(summary["normal_unique_intents_including_warmup"], 8)
@@ -53,6 +81,17 @@ class OfflineBenchmarkTest(unittest.TestCase):
         self.assertTrue(summary["safety"]["guard_layer_duplicate_no_retry"])
         self.assertEqual(summary["safety"]["guard_layer_replays_checked"], 1)
 
+        durable = summary["safety"]["durable_effect_registry"]
+        self.assertTrue(durable["passed"])
+        self.assertEqual(durable["measured_records_checked"], 6)
+        self.assertTrue(durable["measured_records_valid"])
+        self.assertEqual(durable["success_state"], "ENQUEUED")
+        self.assertEqual(durable["success_result_stage"], "BRIDGE_QUEUED")
+        self.assertEqual(durable["fault_state"], "UNKNOWN")
+        self.assertEqual(durable["fault_result_stage"], "SUBMIT_UNKNOWN")
+        self.assertTrue(durable["exact_replays_deduplicated"])
+        self.assertTrue(durable["conflict_rejected"])
+
         success = summary["safety"]["success_guard_probe"]
         self.assertTrue(success["passed"])
         self.assertEqual(success["mock_passorder_calls"], 1)
@@ -61,6 +100,11 @@ class OfflineBenchmarkTest(unittest.TestCase):
         self.assertTrue(success["response_present_before_ack"])
         self.assertEqual(success["response_status"], "accepted")
         self.assertEqual(success["second_drain_count"], 0)
+        self.assertEqual(success["effect_state"], "ENQUEUED")
+        self.assertEqual(success["effect_result_stage"], "BRIDGE_QUEUED")
+        self.assertTrue(success["effect_replay_duplicate"])
+        self.assertTrue(success["effect_conflict_rejected"])
+        self.assertEqual(success["guard_replay_dedupe_layer"], "helper_guard")
 
         fault = summary["safety"]["fault_injection"]
         self.assertTrue(fault["passed"])
@@ -69,6 +113,9 @@ class OfflineBenchmarkTest(unittest.TestCase):
         self.assertEqual(fault["final_guard_state"], "unknown")
         self.assertEqual(fault["response_status"], "submit_unknown")
         self.assertEqual(fault["second_drain_count"], 0)
+        self.assertEqual(fault["effect_state"], "UNKNOWN")
+        self.assertEqual(fault["effect_result_stage"], "SUBMIT_UNKNOWN")
+        self.assertTrue(fault["effect_replay_duplicate"])
 
     def test_seed_determines_record_identity_and_structure(self):
         first = self.run_offline(samples=2, repeats=1, warmup=0)
@@ -95,6 +142,14 @@ class OfflineBenchmarkTest(unittest.TestCase):
         self.assertEqual(first_workload, second_workload)
         self.assertNotEqual(first_workload, different_workload)
         self.assertEqual(
+            [record["intent_hash"] for record in first["records"]],
+            [record["intent_hash"] for record in second["records"]],
+        )
+        self.assertEqual(
+            [record["gateway_effect_fingerprint"] for record in first["records"]],
+            [record["gateway_effect_fingerprint"] for record in second["records"]],
+        )
+        self.assertEqual(
             set(first["records"][0]),
             set(second["records"][0]),
         )
@@ -106,9 +161,15 @@ class OfflineBenchmarkTest(unittest.TestCase):
             "total_to_response_ms",
             "queue_wait_ms",
             "mock_passorder_elapsed_ms",
+            "effect_reserve_ms",
+            "effect_dispatch_barrier_ms",
+            "effect_result_commit_ms",
+            "effect_replay_probe_ms",
+            "durable_total_to_final_state_ms",
         }
         self.assertEqual(set(first["summary"]["metrics_ms"]), expected_metrics)
         for metric in first["summary"]["metrics_ms"].values():
+            self.assertEqual(metric["count"], 2)
             self.assertEqual(
                 set(metric),
                 {"count", "mean", "p50", "p95", "p99", "max"},

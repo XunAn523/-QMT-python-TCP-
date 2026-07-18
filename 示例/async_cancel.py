@@ -28,6 +28,7 @@ def parse_args():
     target.add_argument("--order-id", default="")
     target.add_argument("--order-sysid", default="")
     parser.add_argument("--market", type=int, help="required with --order-sysid")
+    parser.add_argument("--request-id", default="", help="stable effect id for an explicitly safe same-key retry")
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--confirm", default="")
     return parser, parser.parse_args()
@@ -43,12 +44,17 @@ def main() -> int:
     configure_logging(runtime)
     api = build_api(runtime)
     if args.order_id:
-        preview = api.build_cancel_request(args.order_id, async_mode=True)
+        preview = api.build_cancel_request(
+            args.order_id,
+            async_mode=True,
+            request_id=args.request_id,
+        )
     else:
         preview = api.build_cancel_sysid_request(
             args.market,
             args.order_sysid,
             async_mode=True,
+            request_id=args.request_id,
         )
     if not args.live:
         print(json.dumps({
@@ -64,7 +70,12 @@ def main() -> int:
     result = {}
 
     def capture_cancel(message):
-        if str(message.get("type") or "") in {"ASYNC_CANCEL", "ERROR"}:
+        msg_type = str(message.get("type") or "")
+        immediate_reject = (
+            msg_type == "ASYNC_CANCEL"
+            and str(message.get("status") or "") == "REJECTED"
+        )
+        if msg_type in {"ASYNC_CANCEL_RESPONSE", "ERROR"} or immediate_reject:
             result.update(message)
             result_ready.set()
 
@@ -73,15 +84,40 @@ def main() -> int:
     try:
         connect_or_raise(api)
         if args.order_id:
-            msg_id = api.send_cancel_async(args.order_id)
+            msg_id = api.send_cancel_async(
+                args.order_id,
+                request_id=args.request_id,
+            )
         else:
-            msg_id = api.send_cancel_sysid_async(args.market, args.order_sysid)
+            msg_id = api.send_cancel_sysid_async(
+                args.market,
+                args.order_sysid,
+                request_id=args.request_id,
+            )
         print("cancel submitted msg_id=%s" % msg_id)
         if not result_ready.wait(runtime.signal_wait_seconds):
-            print("cancel result is UNKNOWN; inspect ORDER_UPDATE before retry", file=sys.stderr)
+            print(
+                "cancel helper result is UNKNOWN; inspect ORDER_UPDATE before retry",
+                file=sys.stderr,
+            )
             return 6
+        delivery_id = str(result.get("delivery_id") or "")
+        if delivery_id and not api.wait_delivery_acknowledged(
+            delivery_id,
+            timeout=min(5.0, max(1.0, runtime.signal_wait_seconds)),
+        ):
+            print(
+                "cancel result was journaled but DELIVERY_ACK was not sent; "
+                "inspect ORDER_UPDATE before retry",
+                file=sys.stderr,
+            )
+            return 10
         print(json.dumps(redact_for_output(result), ensure_ascii=False, indent=2))
-        return 7 if str(result.get("status") or "") == "REJECTED" else 0
+        if str(result.get("stage") or "") == "REJECTED":
+            return 7
+        if str(result.get("stage") or "") == "SUBMIT_UNKNOWN":
+            return 8
+        return 0
     finally:
         try:
             api.stop()

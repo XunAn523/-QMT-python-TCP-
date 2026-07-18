@@ -372,9 +372,151 @@ class ClientContractTests(unittest.TestCase):
         self.assertEqual(messages[0]["protocol_version"], 2)
         self.assertEqual(messages[0]["account_name"], "account_main")
         self.assertEqual(messages[0]["msg_id"], order_id)
+        self.assertEqual(messages[0]["request_id"], order_id)
         self.assertEqual(messages[1]["type"], "CANCEL_ASYNC")
         self.assertEqual(messages[1]["account_id"], "TEST_ACCOUNT")
         self.assertEqual(messages[1]["msg_id"], cancel_id)
+        self.assertNotIn("request_id", messages[1])
+
+    def test_builders_normalize_explicit_request_id_and_keep_defaults(self):
+        transport = TradeTransport(local_host="", auth_token=TEST_AUTH_TOKEN)
+        client = BridgeClient(connection(9550), transport=transport)
+
+        default_order = client.build_order_request(
+            "600000.SH",
+            "BUY",
+            100,
+            10.23,
+            client_order_id="builder-default-order",
+        )
+        blank_order = client.build_order_request(
+            "600000.SH",
+            "BUY",
+            100,
+            10.23,
+            client_order_id="builder-blank-order",
+            request_id="   ",
+        )
+        explicit_order = client.build_order_request(
+            "600000.SH",
+            "BUY",
+            100,
+            10.23,
+            client_order_id="builder-explicit-order",
+            request_id="  shared-order-effect  ",
+        )
+        self.assertEqual(default_order["request_id"], default_order["msg_id"])
+        self.assertEqual(blank_order["request_id"], blank_order["msg_id"])
+        self.assertEqual(explicit_order["request_id"], "shared-order-effect")
+        self.assertNotEqual(explicit_order["request_id"], explicit_order["msg_id"])
+
+        default_cancel = client.build_cancel_request("QMT-1")
+        blank_cancel = client.build_cancel_request("QMT-1", request_id=" \t ")
+        explicit_cancel = client.build_cancel_request(
+            "QMT-1",
+            request_id="  shared-cancel-effect  ",
+        )
+        self.assertNotIn("request_id", default_cancel)
+        self.assertNotIn("request_id", blank_cancel)
+        self.assertEqual(explicit_cancel["request_id"], "shared-cancel-effect")
+
+        default_sysid = client.build_cancel_sysid_request(0, "SYS-1")
+        blank_sysid = client.build_cancel_sysid_request(
+            0,
+            "SYS-1",
+            request_id="   ",
+        )
+        explicit_sysid = client.build_cancel_sysid_request(
+            0,
+            "SYS-1",
+            request_id="  shared-sysid-effect  ",
+        )
+        self.assertNotIn("request_id", default_sysid)
+        self.assertNotIn("request_id", blank_sysid)
+        self.assertEqual(explicit_sysid["request_id"], "shared-sysid-effect")
+
+    def test_new_msg_ids_can_reuse_one_explicit_effect_request_id(self):
+        transport = TradeTransport(local_host="", auth_token=TEST_AUTH_TOKEN)
+        capture = ConcurrentDetectSocket()
+        with transport._state_lock:
+            transport._socket = capture
+            transport._connected = True
+        client = BridgeClient(connection(9550), transport=transport)
+        client._connected.set()
+
+        first_order_msg_id = client.send_order_async(
+            "600000.SH",
+            "BUY",
+            100,
+            10.23,
+            client_order_id="stable-order-intent",
+            request_id="  stable-order-request  ",
+        )
+        second_order_msg_id = client.send_order_async(
+            "600000.SH",
+            "BUY",
+            100,
+            10.23,
+            client_order_id="stable-order-intent",
+            request_id="stable-order-request",
+        )
+        first_cancel_msg_id = client.send_cancel(
+            "QMT-ORDER-2",
+            request_id="  stable-cancel-request  ",
+        )
+        second_cancel_msg_id = client.send_cancel_async(
+            "QMT-ORDER-2",
+            request_id="stable-cancel-request",
+        )
+        first_sysid_msg_id = client.send_cancel_sysid(
+            0,
+            "SYS-2",
+            request_id="  stable-sysid-request  ",
+        )
+        second_sysid_msg_id = client.send_cancel_sysid_async(
+            0,
+            "SYS-2",
+            request_id="stable-sysid-request",
+        )
+
+        messages = [FrameDecoder().feed(frame)[0] for frame in capture.frames]
+        self.assertEqual(len(messages), 6)
+        returned_msg_ids = (
+            first_order_msg_id,
+            second_order_msg_id,
+            first_cancel_msg_id,
+            second_cancel_msg_id,
+            first_sysid_msg_id,
+            second_sysid_msg_id,
+        )
+        self.assertEqual(
+            [message["msg_id"] for message in messages],
+            list(returned_msg_ids),
+        )
+        self.assertEqual(len(set(returned_msg_ids)), len(returned_msg_ids))
+        self.assertEqual(
+            [message["request_id"] for message in messages[:2]],
+            ["stable-order-request", "stable-order-request"],
+        )
+        self.assertEqual(
+            [message["request_id"] for message in messages[2:4]],
+            ["stable-cancel-request", "stable-cancel-request"],
+        )
+        self.assertEqual(
+            [message["request_id"] for message in messages[4:]],
+            ["stable-sysid-request", "stable-sysid-request"],
+        )
+        self.assertEqual(
+            [message["type"] for message in messages],
+            [
+                "NEW_ASYNC",
+                "NEW_ASYNC",
+                "CANCEL",
+                "CANCEL_ASYNC",
+                "CANCEL_SYSID",
+                "CANCEL_SYSID_ASYNC",
+            ],
+        )
 
     def test_stop_interrupts_reconnect_and_leaks_no_api_threads(self):
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

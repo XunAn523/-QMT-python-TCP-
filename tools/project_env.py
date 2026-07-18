@@ -17,8 +17,8 @@ from typing import Any, Dict, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_FILE = ROOT / ".env"
-GATEWAY_BUILD_ID = "xuanling_local_qmt_gateway_20260717_low_latency_v2_auth_guard"
-HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260716_low_latency_v4_identity_guard"
+GATEWAY_BUILD_ID = "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io"
+HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
 PROTOCOL_VERSION = 2
 KEY_PATTERN = re.compile(r"^QMT_LOCAL_[A-Z0-9_]+$")
 LOCAL_DRIVE = re.compile(r"^[A-Za-z]:$")
@@ -50,10 +50,10 @@ API_KEYS = {
 KNOWN_KEYS = BASE_KEYS | API_KEYS
 
 FIXED_HELPER_SETTINGS: Dict[str, Any] = {
-    "MAX_COMMANDS_PER_TICK": 8,
+    "MAX_COMMANDS_PER_TICK": 4,
     "MAX_QUERIES_PER_TICK": 1,
-    "COMMAND_BUDGET_MS": 35.0,
-    "COMMAND_INTERVAL_MS": 50,
+    "COMMAND_BUDGET_MS": 15.0,
+    "COMMAND_INTERVAL_MS": 25,
     "QUERY_INTERVAL_MS": 500,
     "RECONCILE_INTERVAL_SECONDS": 30,
     "MAINTENANCE_INTERVAL_SECONDS": 60,
@@ -277,7 +277,7 @@ def build_configs(values: Mapping[str, str], allow_example: bool = False) -> Dic
         "query_concurrency": 1,
         "expected_helper_build_id": HELPER_BUILD_ID,
         "expected_protocol_version": PROTOCOL_VERSION,
-        "expected_command_interval_ms": 50,
+        "expected_command_interval_ms": 25,
         "accounts": [account],
     }
     qmt = {

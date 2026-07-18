@@ -114,7 +114,7 @@ Gateway 响应：
   "msg_id": "ping-unique-id",
   "protocol_version": 2,
   "gateway": "local_qmt_gateway",
-  "build_id": "xuanling_local_qmt_gateway_20260717_low_latency_v2_auth_guard",
+  "build_id": "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io",
   "account_id": "REPLACE_WITH_REAL_QMT_ACCOUNT_ID",
   "account_name": "account_main",
   "qmt_status": {
@@ -393,6 +393,7 @@ ACK：
 | `IDEMPOTENCY_CONFLICT` | 同一业务 ID 参数冲突，人工调查 |
 | `INTENT_HASH_MISMATCH` | 删除自造 hash 或按规范计算 |
 | `FRAME_TOO_LARGE` | 缩小查询范围/响应 |
+| `GATEWAY_BUSY` | `effect_started=false` 表示尚未写交易队列、未调用 Helper；按退避策略使用相同幂等 ID 重试，不要生成新 ID |
 | `SUBMIT_UNKNOWN` | 不自动重发，按关联键对账 |
 | `POST_ENQUEUE_STATE_UNCERTAIN` | 可能已经产生副作用，不自动重发 |
 | `RECONCILE_REQUIRED` | 查询订单/成交并人工或规则化对账 |
@@ -477,7 +478,7 @@ python .\示例\async_order.py `
 
 ## 15. 性能与安全验收
 
-二次开发不得改变：单 reader、全发送锁、10 MiB、首帧令牌+protocol+account 认证、PONG build/account 身份、带 `delivery_id` 实例在 handler 成功后 ACK、SQLite writer lease、10ms watcher、50ms Helper command、500ms query、35ms command budget。
+二次开发不得改变：单 reader、全发送锁、10 MiB、首帧令牌+protocol+account 认证、PONG build/account 身份、带 `delivery_id` 实例在 handler 成功后 ACK、SQLite writer lease、10ms watcher、25ms Helper command、500ms query、15ms command budget、每周期最多4条交易命令，以及副作用前有界背压。
 
 发布前测试至少覆盖：分片、粘包、非法长度、非 UTF-8、非 object、非有限数字、缺失/错误令牌、protocol/account 逐一错配、未认证连接无法抢占 primary、错误账户零副作用、Gateway 双开、缺失/相同/冲突订单 ID、ACK 丢失重投、handler 失败、查询 waiter、Helper 离线、断线重连和 `SUBMIT_UNKNOWN` 不重发。
 

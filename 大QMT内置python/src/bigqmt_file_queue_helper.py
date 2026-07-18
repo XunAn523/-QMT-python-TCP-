@@ -22,10 +22,10 @@ ACCOUNT_TYPE = "STOCK"
 RUNTIME_DIR = r"C:\Quant\TradeBridge\runtime\bigqmt\0000"
 ENABLE_TRADING = False
 ENABLE_CANCEL_ORDER = False
-MAX_COMMANDS_PER_TICK = 8
+MAX_COMMANDS_PER_TICK = 4
 MAX_QUERIES_PER_TICK = 1
-COMMAND_BUDGET_MS = 35.0
-COMMAND_INTERVAL_MS = 50
+COMMAND_BUDGET_MS = 15.0
+COMMAND_INTERVAL_MS = 25
 QUERY_INTERVAL_MS = 500
 RECONCILE_INTERVAL_SECONDS = 30
 MAINTENANCE_INTERVAL_SECONDS = 60
@@ -42,7 +42,7 @@ DEFAULT_REMARK = "local_tcp_signal"
 PASSORDER_QUICK_TRADE = 2
 QMT_ORDER_TYPE_DEFAULT = 1101
 QMT_USER_ORDER_ID_MAX_LENGTH = 23
-BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260716_low_latency_v4_identity_guard"
+BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
 # XUANLING_HELPER_CONFIG_END
 
 
@@ -95,6 +95,7 @@ G_METRICS = {
     "command_cycles_total": 0,
     "query_cycles_total": 0,
     "command_timer_overrun_total": 0,
+    "maintenance_deferred_for_command_total": 0,
     "callback_events_total": 0,
     "last_request_elapsed_ms": 0.0,
     "last_snapshot_elapsed_ms": 0.0,
@@ -1511,6 +1512,12 @@ def _cleanup_old_files(folder, cutoff, preserve_guards=False, max_delete=100):
 
 def _run_maintenance_cycle(ContextInfo, source):
     global G_CONTEXT, G_LAST_CALLBACK_SOURCE
+    if _directory_has_json(INBOX_COMMANDS_DIR) or _directory_has_json(PROCESSING_COMMANDS_DIR):
+        G_METRICS["maintenance_deferred_for_command_total"] = G_METRICS.get("maintenance_deferred_for_command_total", 0) + 1
+        return 0
+    if G_LAST_COMMAND_ACTIVITY_AT and _now() - G_LAST_COMMAND_ACTIVITY_AT < LOW_PRIORITY_QUIET_SECONDS:
+        G_METRICS["maintenance_deferred_for_command_total"] = G_METRICS.get("maintenance_deferred_for_command_total", 0) + 1
+        return 0
     G_CONTEXT = ContextInfo
     G_LAST_CALLBACK_SOURCE = source
     ensure_runtime_dirs()
@@ -1534,6 +1541,7 @@ def _run_maintenance_cycle(ContextInfo, source):
     _safe_runtime_write("write_state", write_state, "running")
     _safe_runtime_write("write_metrics", write_metrics)
     _safe_runtime_write("write_readiness", write_readiness)
+    return 1
 
 
 def init(ContextInfo):

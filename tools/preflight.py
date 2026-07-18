@@ -55,7 +55,7 @@ def validate_config(config_path: Path, allow_example: bool = False) -> Dict[str,
         "query_concurrency": 1,
         "expected_helper_build_id": HELPER_BUILD_ID,
         "expected_protocol_version": 2,
-        "expected_command_interval_ms": 50,
+        "expected_command_interval_ms": 25,
     }
     for key, expected in fixed.items():
         if config.get(key) != expected:

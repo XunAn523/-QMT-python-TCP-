@@ -41,13 +41,27 @@ from order_correlation import (
 DEFAULT_MAX_FRAME_BYTES = 10 * 1024 * 1024
 DEFAULT_LOG_DIR = ""
 DEFAULT_RUNTIME_ROOT = ""
-PROXY_BUILD_ID = "xuanling_local_qmt_gateway_20260717_low_latency_v2_auth_guard"
-EXPECTED_LOCAL_HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260716_low_latency_v4_identity_guard"
+PROXY_BUILD_ID = "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io"
+EXPECTED_LOCAL_HELPER_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
 ORDER_INTENT_DEDUPE_SECONDS = 3.0
 ORDER_SIDE_INTENT_SECONDS = 6 * 60 * 60.0
 ORDER_CORRELATION_CACHE_MAX_KEYS = 60000
 ORDER_CORRELATION_MISS_TTL_SECONDS = 30.0
 ASYNC_NORMALIZE_YIELD_EVERY = 512
+MAX_DISPATCH_TASKS_PER_SESSION = 128
+MAX_EFFECT_INFLIGHT_PER_ACCOUNT = 8
+MAX_PENDING_RESPONSES_PER_ACCOUNT = 256
+MAX_RESPONSE_DELIVERY_TASKS_PER_ACCOUNT = 32
+MAX_RESPONSE_SCAN_ENTRIES_PER_TICK = 1024
+MAX_RESPONSE_FALLBACK_CHECKS_PER_TICK = 8
+EFFECTFUL_DISPATCH_MESSAGE_TYPES = frozenset({
+    "NEW",
+    "NEW_ASYNC",
+    "CANCEL",
+    "CANCEL_ASYNC",
+    "CANCEL_SYSID",
+    "CANCEL_SYSID_ASYNC",
+})
 
 STANDARD_BUY_OP_TYPES = {23, 27, 29, 33, 35, 40, 42, 50, 53, 56, 60, 80, 82}
 STANDARD_SELL_OP_TYPES = {24, 28, 30, 31, 32, 34, 36, 41, 43, 44, 45, 51, 52, 54, 55, 61, 81, 83}
@@ -88,6 +102,14 @@ def safe_str(value: Any, default: str = "") -> str:
         return str(value)
     except Exception:
         return default
+
+
+def first_nonempty_stripped(*values: Any) -> str:
+    for value in values:
+        text = safe_str(value).strip()
+        if text:
+            return text
+    return ""
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -834,10 +856,90 @@ class FileQueueHelperClient:
         timeout: float,
         timeout_as_queued: bool = False,
     ) -> Dict[str, Any]:
-        return await run_blocking(self.request_sync, action, payload or {}, timeout, timeout_as_queued)
+        request_id, immediate = await run_blocking(
+            self._prepare_request_sync,
+            action,
+            payload or {},
+            timeout,
+        )
+        if immediate is not None:
+            return immediate
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.01, timeout)
+        while loop.time() < deadline:
+            ready, response = await run_blocking(
+                self._read_response_if_ready_sync,
+                request_id,
+            )
+            if ready:
+                return response
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.02, remaining))
+        return self._request_timeout_result(
+            action,
+            request_id,
+            timeout_as_queued,
+        )
+
+    def _prepare_request_sync(
+        self,
+        action: str,
+        payload: Dict[str, Any],
+        timeout: float,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        self.ensure_dirs()
+        request_id = first_nonempty_stripped(
+            payload.get("request_id"),
+            payload.get("msg_id"),
+            payload.get("client_order_id"),
+        ) or make_request_id(action)
+        payload = dict(payload)
+        payload["request_id"] = request_id
+        response_path = self._response_path(request_id)
+        if response_path.exists():
+            return request_id, self._decode_response(response_path)
+        request = self._build_request(action, payload, request_id, timeout)
+        existing_path, _ = self._find_existing_request_file(request_id)
+        if not existing_path:
+            queue_dir = self.commands if action in ("place_order", "cancel_order") else self.queries
+            request_path = queue_dir / (safe_filename(request_id) + ".json")
+            atomic_write_json(request_path, request)
+        return request_id, None
+
+    def _read_response_if_ready_sync(
+        self,
+        request_id: str,
+    ) -> tuple[bool, Dict[str, Any]]:
+        response_path = self._response_path(request_id)
+        if not response_path.exists():
+            return False, {}
+        return True, self._decode_response(response_path)
+
+    def _request_timeout_result(
+        self,
+        action: str,
+        request_id: str,
+        timeout_as_queued: bool,
+    ) -> Dict[str, Any]:
+        if timeout_as_queued:
+            return {
+                "status": "queued",
+                "queued": True,
+                "request_id": request_id,
+                "timeout": True,
+            }
+        message = "helper response timeout action=%s request_id=%s" % (action, request_id)
+        self._record_failure(message)
+        raise HelperTimeout(message, "HELPER_TIMEOUT")
 
     def enqueue_action(self, action: str, payload: Dict[str, Any], timeout: float = 0.0) -> Dict[str, Any]:
-        request_id = safe_str(payload.get("request_id") or payload.get("msg_id") or payload.get("client_order_id") or make_request_id(action))
+        request_id = first_nonempty_stripped(
+            payload.get("request_id"),
+            payload.get("msg_id"),
+            payload.get("client_order_id"),
+        ) or make_request_id(action)
         payload = dict(payload)
         payload["request_id"] = request_id
         response_path = self._response_path(request_id)
@@ -873,7 +975,11 @@ class FileQueueHelperClient:
         timeout_as_queued: bool = False,
     ) -> Dict[str, Any]:
         self.ensure_dirs()
-        request_id = safe_str(payload.get("request_id") or payload.get("msg_id") or payload.get("client_order_id") or make_request_id(action))
+        request_id = first_nonempty_stripped(
+            payload.get("request_id"),
+            payload.get("msg_id"),
+            payload.get("client_order_id"),
+        ) or make_request_id(action)
         payload = dict(payload)
         payload["request_id"] = request_id
         response_path = self._response_path(request_id)
@@ -890,16 +996,7 @@ class FileQueueHelperClient:
             if response_path.exists():
                 return self._decode_response(response_path)
             time.sleep(0.02)
-        if timeout_as_queued:
-            return {
-                "status": "queued",
-                "queued": True,
-                "request_id": request_id,
-                "timeout": True,
-            }
-        message = "helper response timeout action=%s request_id=%s" % (action, request_id)
-        self._record_failure(message)
-        raise HelperTimeout(message, "HELPER_TIMEOUT")
+        return self._request_timeout_result(action, request_id, timeout_as_queued)
 
     def _build_request(self, action: str, payload: Dict[str, Any], request_id: str, timeout: float = 0.0) -> Dict[str, Any]:
         created = now()
@@ -950,6 +1047,108 @@ class FileQueueHelperClient:
         if not path.exists():
             return {}
         return read_json_file(path)
+
+    async def read_available_responses(
+        self,
+        request_ids: Set[str],
+        max_entries: int,
+        max_responses: int,
+    ) -> tuple[Dict[str, Dict[str, Any]], Set[str], bool]:
+        return await run_blocking(
+            self.read_available_responses_sync,
+            request_ids,
+            max_entries,
+            max_responses,
+        )
+
+    def read_available_responses_sync(
+        self,
+        request_ids: Set[str],
+        max_entries: int,
+        max_responses: int,
+    ) -> tuple[Dict[str, Dict[str, Any]], Set[str], bool]:
+        """Read one bounded directory batch without polling every pending path."""
+        entry_limit = max(1, int(max_entries))
+        response_limit = max(1, int(max_responses))
+        filename_to_request_id = {
+            safe_filename(request_id) + ".json": request_id
+            for request_id in request_ids
+            if request_id
+        }
+        if not filename_to_request_id:
+            return {}, set(), True
+        entries = None
+        responses: Dict[str, Dict[str, Any]] = {}
+        observed_request_ids: Set[str] = set()
+        scan_complete = True
+        try:
+            entries = os.scandir(str(self.responses))
+            scanned = 0
+            for entry in entries:
+                scanned += 1
+                if scanned > entry_limit:
+                    scan_complete = False
+                    break
+                request_id = filename_to_request_id.get(entry.name)
+                if not request_id or not entry.is_file():
+                    continue
+                observed_request_ids.add(request_id)
+                try:
+                    response = read_json_file(Path(entry.path))
+                except Exception as exc:
+                    self.logger.warning(
+                        "helper_response_read_failed request_id=%s error=%s",
+                        request_id,
+                        exc,
+                    )
+                    continue
+                if response:
+                    responses[request_id] = response
+                if len(responses) >= response_limit:
+                    scan_complete = False
+                    break
+        except FileNotFoundError:
+            return {}, set(), True
+        finally:
+            if entries is not None:
+                try:
+                    entries.close()
+                except OSError:
+                    pass
+        return responses, observed_request_ids, scan_complete
+
+    async def read_targeted_responses(
+        self,
+        request_ids: Set[str],
+    ) -> tuple[Dict[str, Dict[str, Any]], Set[str]]:
+        return await run_blocking(self.read_targeted_responses_sync, request_ids)
+
+    def read_targeted_responses_sync(
+        self,
+        request_ids: Set[str],
+    ) -> tuple[Dict[str, Dict[str, Any]], Set[str]]:
+        """Check a small rotated request-id batch to prevent prefix-scan starvation."""
+        responses: Dict[str, Dict[str, Any]] = {}
+        observed_request_ids: Set[str] = set()
+        for request_id in request_ids:
+            if not request_id:
+                continue
+            response_path = self._response_path(request_id)
+            if not response_path.is_file():
+                continue
+            observed_request_ids.add(request_id)
+            try:
+                response = read_json_file(response_path)
+            except Exception as exc:
+                self.logger.warning(
+                    "helper_response_read_failed request_id=%s error=%s",
+                    request_id,
+                    exc,
+                )
+                continue
+            if response:
+                responses[request_id] = response
+        return responses, observed_request_ids
 
     async def ack_response(self, request_id: str) -> None:
         await run_blocking(self.ack_response_sync, request_id)
@@ -1120,6 +1319,11 @@ class AccountRuntime:
                     "recovered": True,
                 }
         self.pending_lock = asyncio.Lock()
+        self.pending_response_reservations: Set[str] = set()
+        self.response_delivery_tasks: Dict[str, asyncio.Task] = {}
+        self.response_fallback_cursor = 0
+        self.effect_lock = asyncio.Lock()
+        self.effect_inflight = 0
         self.delivery_waiters: Dict[str, asyncio.Event] = {}
         self.delivery_lock = asyncio.Lock()
         self.query_semaphore = asyncio.Semaphore(max(1, cfg.query_concurrency))
@@ -1141,6 +1345,58 @@ class AccountRuntime:
             "last_error": "",
             "updated_at": now(),
         }
+
+    async def try_acquire_effect(self) -> bool:
+        async with self.effect_lock:
+            if self.effect_inflight >= MAX_EFFECT_INFLIGHT_PER_ACCOUNT:
+                return False
+            self.effect_inflight += 1
+            return True
+
+    async def release_effect(self) -> None:
+        async with self.effect_lock:
+            if self.effect_inflight > 0:
+                self.effect_inflight -= 1
+
+    async def try_reserve_pending_response(self, request_id: str) -> tuple[bool, bool]:
+        """Return (capacity_available, reservation_owned_by_caller)."""
+        async with self.pending_lock:
+            if request_id in self.pending_responses or request_id in self.pending_response_reservations:
+                return True, False
+            if len(self.response_delivery_tasks) >= MAX_RESPONSE_DELIVERY_TASKS_PER_ACCOUNT:
+                return False, False
+            occupied = len(self.pending_responses) + len(self.pending_response_reservations)
+            if occupied >= MAX_PENDING_RESPONSES_PER_ACCOUNT:
+                return False, False
+            self.pending_response_reservations.add(request_id)
+            return True, True
+
+    async def commit_pending_response(self, request_id: str, item: Dict[str, Any]) -> None:
+        async with self.pending_lock:
+            self.pending_response_reservations.discard(request_id)
+            self.pending_responses[request_id] = item
+
+    async def release_pending_response_reservation(self, request_id: str) -> None:
+        async with self.pending_lock:
+            self.pending_response_reservations.discard(request_id)
+
+    def next_response_fallback_ids(
+        self,
+        request_ids: List[str],
+        limit: int,
+    ) -> List[str]:
+        """Return a bounded rotating slice so no pending request can starve."""
+        if not request_ids:
+            self.response_fallback_cursor = 0
+            return []
+        count = min(len(request_ids), max(1, int(limit)))
+        start = self.response_fallback_cursor % len(request_ids)
+        selected = [
+            request_ids[(start + offset) % len(request_ids)]
+            for offset in range(count)
+        ]
+        self.response_fallback_cursor = (start + count) % len(request_ids)
+        return selected
 
     def remember(self, msg_id: str, reply: Dict[str, Any]) -> None:
         if not msg_id:
@@ -1417,7 +1673,12 @@ class TcpClientSession:
         self.peer = "%s:%s" % peer if isinstance(peer, tuple) and len(peer) >= 2 else safe_str(peer)
         self.last_recv_at = now()
         self.dispatch_tasks: Set[asyncio.Task] = set()
+        self.effect_dispatch_tasks: Set[asyncio.Task] = set()
+        self.dispatch_settle_lock = asyncio.Lock()
         self.registered = False
+
+    def dispatch_capacity_available(self) -> bool:
+        return len(self.dispatch_tasks) < MAX_DISPATCH_TASKS_PER_SESSION
 
     async def send(self, msg: Dict[str, Any]) -> bool:
         if self.closed:
@@ -1531,7 +1792,17 @@ class BigQmtGatewayProxy:
             self.poll_tasks.append(asyncio.create_task(self.maintenance_loop(runtime)))
 
     async def stop(self) -> None:
-        if not self.running:
+        has_delivery_work = any(
+            runtime.response_delivery_tasks
+            for runtime in self.runtimes
+        )
+        has_session_work = any(runtime.clients for runtime in self.runtimes)
+        if (
+            not self.running
+            and not self.poll_tasks
+            and not has_delivery_work
+            and not has_session_work
+        ):
             return
         self.running = False
         self.logger.info("proxy_stop requested")
@@ -1539,6 +1810,16 @@ class BigQmtGatewayProxy:
             task.cancel()
         await asyncio.gather(*self.poll_tasks, return_exceptions=True)
         self.poll_tasks.clear()
+        response_delivery_tasks = [
+            task
+            for runtime in self.runtimes
+            for task in runtime.response_delivery_tasks.values()
+        ]
+        for task in response_delivery_tasks:
+            task.cancel()
+        await asyncio.gather(*response_delivery_tasks, return_exceptions=True)
+        for runtime in self.runtimes:
+            runtime.response_delivery_tasks.clear()
         for runtime in self.runtimes:
             if runtime.server:
                 runtime.server.close()
@@ -1546,6 +1827,14 @@ class BigQmtGatewayProxy:
             async with runtime.clients_lock:
                 clients = list(runtime.clients)
             await asyncio.gather(*(client.close("proxy_stop") for client in clients), return_exceptions=True)
+            await asyncio.gather(
+                *(self._settle_session_dispatch_tasks(client) for client in clients),
+                return_exceptions=True,
+            )
+            await asyncio.gather(
+                *(self.unregister_client(runtime, client) for client in clients),
+                return_exceptions=True,
+            )
             runtime.correlation.close()
             runtime.writer_lease.release()
 
@@ -1563,12 +1852,80 @@ class BigQmtGatewayProxy:
             if runtime.primary is session:
                 runtime.primary = None
 
+    async def _settle_session_dispatch_tasks(
+        self,
+        session: TcpClientSession,
+    ) -> None:
+        """Cancel read-only work but let started trading effects reach durable state."""
+        async with session.dispatch_settle_lock:
+            while session.dispatch_tasks:
+                tasks = list(session.dispatch_tasks)
+                effect_tasks = [
+                    task for task in tasks
+                    if task in session.effect_dispatch_tasks
+                ]
+                ordinary_tasks = [
+                    task for task in tasks
+                    if task not in session.effect_dispatch_tasks
+                ]
+                for task in ordinary_tasks:
+                    task.cancel()
+                await asyncio.gather(
+                    *(ordinary_tasks + effect_tasks),
+                    return_exceptions=True,
+                )
+                for task in tasks:
+                    session.dispatch_tasks.discard(task)
+                    session.effect_dispatch_tasks.discard(task)
+
+    @staticmethod
+    def gateway_busy_reply(
+        runtime: AccountRuntime,
+        msg: Dict[str, Any],
+        capacity: str,
+    ) -> Dict[str, Any]:
+        msg_type = safe_str(msg.get("type"))
+        reply_type = {
+            "NEW": "EXEC_REPORT",
+            "NEW_ASYNC": "ASYNC_ORDER",
+            "CANCEL": "EXEC_REPORT",
+            "CANCEL_ASYNC": "ASYNC_CANCEL",
+            "CANCEL_SYSID": "EXEC_REPORT",
+            "CANCEL_SYSID_ASYNC": "ASYNC_CANCEL",
+        }.get(msg_type, "ERROR")
+        reply = {
+            "protocol_version": 2,
+            "type": reply_type,
+            "msg_id": safe_str(msg.get("msg_id")),
+            "status": "REJECTED",
+            "stage": "REJECTED",
+            "code": "GATEWAY_BUSY",
+            "effect_started": False,
+            "retryable": True,
+            "capacity": capacity,
+            "account_id": runtime.cfg.account_id,
+            "request_id": first_nonempty_stripped(
+                msg.get("request_id"),
+                msg.get("client_order_id"),
+                msg.get("msg_id"),
+            ),
+            "client_order_id": safe_str(msg.get("client_order_id")),
+            "trace_id": safe_str(msg.get("trace_id")),
+            "reject_reason": "gateway capacity is full before any trading effect; retry with the same idempotency key",
+            "timestamp": now(),
+        }
+        if msg_type.endswith("_ASYNC"):
+            reply["seq"] = -1
+        return reply
+
     async def handle_client(self, runtime: AccountRuntime, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         session = TcpClientSession(runtime, reader, writer, self.max_frame_bytes)
         self.logger.info("tcp_accept port=%s peer=%s", runtime.cfg.tcp_port, session.peer)
         try:
             while self.running and not session.closed:
                 msg = await asyncio.wait_for(read_frame(reader, self.max_frame_bytes), timeout=self.cfg.tcp_idle_timeout_seconds)
+                if not self.running or session.closed:
+                    break
                 session.last_recv_at = now()
                 msg["_gateway_received_at_ns"] = time.time_ns()
                 raw_msg_id = msg.get("msg_id")
@@ -1646,9 +2003,19 @@ class BigQmtGatewayProxy:
                         (time.perf_counter() - handshake_started) * 1000,
                     )
                     continue
+                msg_type = safe_str(msg.get("type"))
+                if msg_type in ("PING", "PONG", "DELIVERY_ACK"):
+                    await self._dispatch_and_send(runtime, session, msg)
+                    continue
+                if not session.dispatch_capacity_available():
+                    await session.send(self.gateway_busy_reply(runtime, msg, "connection_dispatch"))
+                    continue
                 task = asyncio.create_task(self._dispatch_and_send(runtime, session, msg))
                 session.dispatch_tasks.add(task)
+                if msg_type in EFFECTFUL_DISPATCH_MESSAGE_TYPES:
+                    session.effect_dispatch_tasks.add(task)
                 task.add_done_callback(session.dispatch_tasks.discard)
+                task.add_done_callback(session.effect_dispatch_tasks.discard)
         except asyncio.IncompleteReadError:
             pass
         except asyncio.TimeoutError:
@@ -1656,11 +2023,9 @@ class BigQmtGatewayProxy:
         except Exception as exc:
             self.logger.warning("tcp_client_error account=%s port=%s peer=%s error=%s", runtime.cfg.account_id, runtime.cfg.tcp_port, session.peer, exc)
         finally:
-            for task in list(session.dispatch_tasks):
-                task.cancel()
-            await asyncio.gather(*session.dispatch_tasks, return_exceptions=True)
-            await self.unregister_client(runtime, session)
             await session.close("client_loop_end")
+            await self._settle_session_dispatch_tasks(session)
+            await self.unregister_client(runtime, session)
 
     async def _dispatch_and_send(self, runtime: AccountRuntime, session: TcpClientSession, msg: Dict[str, Any]) -> None:
         started = time.perf_counter()
@@ -1750,18 +2115,50 @@ class BigQmtGatewayProxy:
             return None
         if msg_type == "QUERY":
             return await self.handle_query_brokered(runtime, msg)
-        if msg_type in ("NEW", "NEW_ASYNC"):
-            reply = await self.handle_new(runtime, msg, async_mode=(msg_type == "NEW_ASYNC"))
-            runtime.remember(msg_id, reply)
-            return reply
-        if msg_type in ("CANCEL", "CANCEL_ASYNC"):
-            reply = await self.handle_cancel(runtime, msg, async_mode=(msg_type == "CANCEL_ASYNC"))
-            runtime.remember(msg_id, reply)
-            return reply
-        if msg_type in ("CANCEL_SYSID", "CANCEL_SYSID_ASYNC"):
-            reply = await self.handle_cancel_sysid(runtime, msg, async_mode=(msg_type == "CANCEL_SYSID_ASYNC"))
-            runtime.remember(msg_id, reply)
-            return reply
+        if msg_type in {
+            "NEW", "NEW_ASYNC", "CANCEL", "CANCEL_ASYNC",
+            "CANCEL_SYSID", "CANCEL_SYSID_ASYNC",
+        }:
+            if not await runtime.try_acquire_effect():
+                return self.gateway_busy_reply(runtime, msg, "account_effect_inflight")
+            pending_request_id = ""
+            pending_reservation_owned = False
+            try:
+                if msg_type == "NEW_ASYNC" and safe_str(msg.get("client_order_id")).strip():
+                    pending_request_id = first_nonempty_stripped(
+                        msg.get("request_id"),
+                        msg.get("client_order_id"),
+                        msg_id,
+                    )
+                    capacity_available, pending_reservation_owned = (
+                        await runtime.try_reserve_pending_response(pending_request_id)
+                    )
+                    if not capacity_available:
+                        return self.gateway_busy_reply(runtime, msg, "account_pending_response")
+                if msg_type in ("NEW", "NEW_ASYNC"):
+                    reply = await self.handle_new(
+                        runtime,
+                        msg,
+                        async_mode=(msg_type == "NEW_ASYNC"),
+                    )
+                elif msg_type in ("CANCEL", "CANCEL_ASYNC"):
+                    reply = await self.handle_cancel(
+                        runtime,
+                        msg,
+                        async_mode=(msg_type == "CANCEL_ASYNC"),
+                    )
+                else:
+                    reply = await self.handle_cancel_sysid(
+                        runtime,
+                        msg,
+                        async_mode=(msg_type == "CANCEL_SYSID_ASYNC"),
+                    )
+                runtime.remember(msg_id, reply)
+                return reply
+            finally:
+                if pending_reservation_owned:
+                    await runtime.release_pending_response_reservation(pending_request_id)
+                await runtime.release_effect()
         if msg_type == "FUND_TRANSFER":
             return await self.handle_fund_transfer(runtime, msg)
         if msg_type == "SYNC_TRADE":
@@ -2198,12 +2595,55 @@ class BigQmtGatewayProxy:
             }
         runtime.remember_order_correlation(existing)
         if idempotent:
-            return {
+            existing_stage = safe_str(existing.get("stage") or "RESERVED").strip().upper()
+            known_submitted_stages = {
+                "QMT_SUBMITTED",
+                "QMT_ORDER_CREATED",
+                "BROKER_ACCEPTED",
+                "PARTIAL",
+                "FILLED",
+                "CANCELLED",
+            }
+            if existing_stage in known_submitted_stages:
+                replay_status = "SENT" if async_mode else "ACCEPTED"
+                submit_result = "KNOWN"
+                replay_code = ""
+                replay_reason = ""
+            elif existing_stage == "REJECTED":
+                replay_status = "REJECTED"
+                submit_result = "REJECTED"
+                replay_code = "ORDER_REJECTED"
+                replay_reason = (
+                    "existing idempotent order was rejected; do not retry with a new idempotency key"
+                )
+            elif existing_stage == "SUBMIT_UNKNOWN":
+                replay_status = "UNKNOWN"
+                submit_result = "UNKNOWN"
+                replay_code = "QMT_SUBMIT_RESULT_UNKNOWN"
+                replay_reason = (
+                    "existing QMT submission result is unknown; do not retry automatically"
+                )
+            elif existing_stage in ("RESERVED", "BRIDGE_QUEUED"):
+                replay_status = "UNKNOWN"
+                submit_result = "PENDING"
+                replay_code = "REQUEST_IN_PROGRESS"
+                replay_reason = (
+                    "existing idempotent request is still being processed; wait for its result and do not resubmit with a new idempotency key"
+                )
+            else:
+                replay_status = "UNKNOWN"
+                submit_result = "UNKNOWN"
+                replay_code = "CORRELATION_STATE_UNKNOWN"
+                replay_reason = (
+                    "existing idempotent request has an unknown correlation state; do not retry automatically"
+                )
+            replay = {
                 "protocol_version": 2,
                 "type": "ASYNC_ORDER" if async_mode else "EXEC_REPORT",
                 "msg_id": msg_id,
-                "status": "SENT" if async_mode else "ACCEPTED",
-                "stage": safe_str(existing.get("stage") or "BRIDGE_QUEUED"),
+                "status": replay_status,
+                "stage": existing_stage,
+                "submit_result": submit_result,
                 "request_id": existing.get("request_id"),
                 "client_order_id": existing.get("client_order_id"),
                 "trace_id": existing.get("trace_id"),
@@ -2213,21 +2653,35 @@ class BigQmtGatewayProxy:
                 "dedupe_layer": "gateway_correlation",
                 "timestamp": now(),
             }
+            if replay_code:
+                replay["code"] = replay_code
+                replay["reject_reason"] = replay_reason
+                replay["retryable"] = False
+            return replay
         effect_started = False
         try:
             effect_started = True
             data = await runtime.helper.place_order(payload, wait=not async_mode)
-            submit_status = safe_str(data.get("status") or "queued")
+            submit_status = safe_str(data.get("status") or "queued").strip().lower()
             failed = submit_status == "failed"
+            submit_unknown = submit_status == "submit_unknown"
             if async_mode:
                 queued_at_ns = time.time_ns()
                 reply = {
                     "protocol_version": 2,
                     "type": "ASYNC_ORDER",
                     "msg_id": msg_id,
-                    "seq": 0 if not failed else -1,
-                    "status": "SENT" if not failed else "REJECTED",
-                    "stage": "BRIDGE_QUEUED" if not failed else "REJECTED",
+                    "seq": -1 if failed else 0,
+                    "status": (
+                        "REJECTED" if failed
+                        else "UNKNOWN" if submit_unknown
+                        else "SENT"
+                    ),
+                    "stage": (
+                        "REJECTED" if failed
+                        else "SUBMIT_UNKNOWN" if submit_unknown
+                        else "BRIDGE_QUEUED"
+                    ),
                     "request_id": data.get("request_id") or payload["request_id"],
                     "client_order_id": payload.get("client_order_id", ""),
                     "trace_id": payload.get("trace_id", ""),
@@ -2249,14 +2703,25 @@ class BigQmtGatewayProxy:
                     "qmt_status": runtime.qmt_status,
                     "timestamp": now(),
                 }
-                if not failed:
+                if submit_unknown:
+                    reply["submit_result"] = "UNKNOWN"
+                    reply["code"] = "QMT_SUBMIT_RESULT_UNKNOWN"
+                    reply["reject_reason"] = (
+                        "QMT returned no stable submission result; do not retry automatically"
+                    )
+                    await run_blocking(
+                        runtime.correlation.update_stage,
+                        runtime.cfg.account_id,
+                        payload["client_order_id"],
+                        "SUBMIT_UNKNOWN",
+                    )
+                elif not failed:
                     await run_blocking(runtime.correlation.update_stage, runtime.cfg.account_id, payload["client_order_id"], "BRIDGE_QUEUED")
-                    async with runtime.pending_lock:
-                        runtime.pending_responses[payload["request_id"]] = {
-                            "payload": dict(payload),
-                            "queued_at": now(),
-                            "deadline_at": now() + runtime.cfg.request_timeout_seconds,
-                        }
+                    await runtime.commit_pending_response(payload["request_id"], {
+                        "payload": dict(payload),
+                        "queued_at": now(),
+                        "deadline_at": now() + runtime.cfg.request_timeout_seconds,
+                    })
                 else:
                     await run_blocking(runtime.correlation.update_stage, runtime.cfg.account_id, payload["client_order_id"], "REJECTED")
                 return reply
@@ -2264,7 +2729,11 @@ class BigQmtGatewayProxy:
                 "type": "EXEC_REPORT",
                 "msg_id": msg_id,
                 "order_id": safe_str(data.get("order_id") or ""),
-                "status": "ACCEPTED" if not failed else "REJECTED",
+                "status": (
+                    "REJECTED" if failed
+                    else "UNKNOWN" if submit_unknown
+                    else "ACCEPTED"
+                ),
                 "submit_status": submit_status,
                 "request_id": data.get("request_id") or payload["request_id"],
                 "client_order_id": payload.get("client_order_id", ""),
@@ -2281,7 +2750,24 @@ class BigQmtGatewayProxy:
                 "qmt_status": runtime.qmt_status,
                 "timestamp": now(),
             }
-            stage = "REJECTED" if failed else ("SUBMIT_UNKNOWN" if submit_status == "submit_unknown" else "QMT_SUBMITTED")
+            queued_timeout = submit_status == "queued" and bool(data.get("timeout"))
+            stage = (
+                "REJECTED" if failed
+                else "SUBMIT_UNKNOWN" if submit_status == "submit_unknown" or queued_timeout
+                else "QMT_SUBMITTED"
+            )
+            if queued_timeout:
+                reply["status"] = "UNKNOWN"
+                reply["submit_result"] = "UNKNOWN"
+                reply["code"] = "HELPER_RESPONSE_TIMEOUT"
+                reply["reject_reason"] = "helper response not observed; do not retry automatically"
+            elif submit_unknown:
+                reply["submit_result"] = "UNKNOWN"
+                reply["code"] = "QMT_SUBMIT_RESULT_UNKNOWN"
+                reply["reject_reason"] = (
+                    safe_str(data.get("error")).strip()
+                    or "QMT returned no stable submission result"
+                ) + "; do not retry automatically"
             await run_blocking(
                 lambda: runtime.correlation.update_stage(
                     runtime.cfg.account_id, payload["client_order_id"], stage,
@@ -2296,6 +2782,12 @@ class BigQmtGatewayProxy:
             runtime.update_status_offline(exc)
             uncertain = effect_started
             fallback_stage = "SUBMIT_UNKNOWN" if uncertain else "REJECTED"
+            reject_reason = safe_str(exc)
+            if uncertain:
+                reject_reason = (
+                    "%s; submission state unknown; do not retry automatically"
+                    % reject_reason
+                )
             try:
                 await run_blocking(
                     runtime.correlation.update_stage,
@@ -2313,8 +2805,9 @@ class BigQmtGatewayProxy:
                     "seq": 0 if uncertain else -1,
                     "status": "SENT" if uncertain else "REJECTED",
                     "stage": fallback_stage,
+                    "submit_result": "UNKNOWN" if uncertain else "NOT_STARTED",
                     "code": "POST_ENQUEUE_STATE_UNCERTAIN" if uncertain else "HELPER_NOT_READY",
-                    "reject_reason": safe_str(exc),
+                    "reject_reason": reject_reason,
                     "client_order_id": payload.get("client_order_id", ""),
                     "qmt_status": runtime.qmt_status,
                     "timestamp": now(),
@@ -2323,15 +2816,17 @@ class BigQmtGatewayProxy:
                 "type": "EXEC_REPORT",
                 "msg_id": msg_id,
                 "order_id": "",
-                "status": "ACCEPTED" if uncertain else "REJECTED",
+                "status": "UNKNOWN" if uncertain else "REJECTED",
                 "stage": fallback_stage,
+                "submit_result": "UNKNOWN" if uncertain else "NOT_STARTED",
+                "code": "POST_ENQUEUE_STATE_UNCERTAIN" if uncertain else "HELPER_NOT_READY",
                 "symbol": payload.get("symbol", ""),
                 "side": payload.get("side", ""),
                 "quantity": payload.get("quantity", 0),
                 "price": payload.get("price", 0.0),
                 "filled_qty": 0,
                 "filled_price": 0.0,
-                "reject_reason": safe_str(exc),
+                "reject_reason": reject_reason,
                 "client_order_id": payload.get("client_order_id", ""),
                 "qmt_status": runtime.qmt_status,
                 "timestamp": now(),
@@ -2342,7 +2837,11 @@ class BigQmtGatewayProxy:
         side = safe_str(msg.get("side") or "BUY").strip().upper()
         client_order_id = safe_str(msg.get("client_order_id") or "").strip()
         msg_id = safe_str(msg.get("msg_id") or "").strip()
-        request_id = safe_str(msg.get("request_id") or client_order_id or msg_id or make_request_id("order")).strip()
+        request_id = first_nonempty_stripped(
+            msg.get("request_id"),
+            client_order_id,
+            msg_id,
+        ) or make_request_id("order")
         qmt_user_order_id = safe_str(msg.get("qmt_user_order_id") or "").strip()
         if not qmt_user_order_id:
             trader_prefix = "".join(
@@ -2593,19 +3092,80 @@ class BigQmtGatewayProxy:
                     continue
 
                 async with runtime.pending_lock:
-                    pending = list(runtime.pending_responses.items())[:64]
-                if pending:
-                    results = await asyncio.gather(*(
-                        self._process_pending_response(runtime, request_id, item)
-                        for request_id, item in pending
-                    ), return_exceptions=True)
-                    for result in results:
-                        if isinstance(result, Exception):
-                            self.logger.warning(
-                                "pending_response_delivery_failed account=%s error=%s",
-                                runtime.cfg.account_id,
-                                result,
+                    pending = dict(runtime.pending_responses)
+                active_request_ids = set(runtime.response_delivery_tasks)
+                available_slots = max(
+                    0,
+                    MAX_RESPONSE_DELIVERY_TASKS_PER_ACCOUNT
+                    - len(runtime.response_delivery_tasks),
+                )
+                candidates = {
+                    request_id: item
+                    for request_id, item in pending.items()
+                    if request_id not in active_request_ids
+                }
+                responses: Dict[str, Dict[str, Any]] = {}
+                observed_request_ids: Set[str] = set()
+                timeout_check_ids: List[str] = []
+                scan_complete = True
+                if candidates and available_slots:
+                    responses, observed_request_ids, scan_complete = (
+                        await runtime.helper.read_available_responses(
+                            set(candidates),
+                            MAX_RESPONSE_SCAN_ENTRIES_PER_TICK,
+                            available_slots,
+                        )
+                    )
+                    if scan_complete:
+                        timeout_check_ids = list(candidates)
+                    else:
+                        fallback_ids = runtime.next_response_fallback_ids(
+                            list(candidates),
+                            MAX_RESPONSE_FALLBACK_CHECKS_PER_TICK,
+                        )
+                        targeted_responses, targeted_observed = (
+                            await runtime.helper.read_targeted_responses(
+                                set(fallback_ids)
                             )
+                        )
+                        combined_responses = dict(targeted_responses)
+                        combined_responses.update(responses)
+                        responses = combined_responses
+                        observed_request_ids.update(targeted_observed)
+                        timeout_check_ids = fallback_ids
+                for request_id, response in responses.items():
+                    if available_slots <= 0:
+                        break
+                    item = candidates.get(request_id)
+                    if item is None:
+                        continue
+                    if self._start_response_delivery_task(
+                        runtime,
+                        request_id,
+                        item,
+                        response,
+                    ):
+                        available_slots -= 1
+
+                if timeout_check_ids and available_slots:
+                    now_ts = now()
+                    for request_id in timeout_check_ids:
+                        if available_slots <= 0:
+                            break
+                        if request_id in observed_request_ids:
+                            continue
+                        item = candidates.get(request_id)
+                        if item is None:
+                            continue
+                        if now_ts < safe_float(item.get("deadline_at"), now_ts + 1):
+                            continue
+                        if self._start_response_delivery_task(
+                            runtime,
+                            request_id,
+                            item,
+                            {},
+                        ):
+                            available_slots -= 1
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
@@ -2613,13 +3173,59 @@ class BigQmtGatewayProxy:
                 self.logger.warning("response_watcher_failed account=%s error=%s", runtime.cfg.account_id, exc)
                 await asyncio.sleep(min(1.0, interval * 10))
 
+    def _start_response_delivery_task(
+        self,
+        runtime: AccountRuntime,
+        request_id: str,
+        item: Dict[str, Any],
+        response: Dict[str, Any],
+    ) -> bool:
+        if request_id in runtime.response_delivery_tasks:
+            return False
+        if len(runtime.response_delivery_tasks) >= MAX_RESPONSE_DELIVERY_TASKS_PER_ACCOUNT:
+            return False
+        task = asyncio.create_task(
+            self._process_pending_response(runtime, request_id, item, response)
+        )
+        runtime.response_delivery_tasks[request_id] = task
+        task.add_done_callback(
+            lambda completed, rt=runtime, rid=request_id: self._response_delivery_done(
+                rt,
+                rid,
+                completed,
+            )
+        )
+        return True
+
+    def _response_delivery_done(
+        self,
+        runtime: AccountRuntime,
+        request_id: str,
+        task: asyncio.Task,
+    ) -> None:
+        if runtime.response_delivery_tasks.get(request_id) is task:
+            runtime.response_delivery_tasks.pop(request_id, None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            self.logger.warning(
+                "pending_response_delivery_failed account=%s request_id=%s error=%s",
+                runtime.cfg.account_id,
+                request_id,
+                error,
+            )
+
     async def _process_pending_response(
         self,
         runtime: AccountRuntime,
         request_id: str,
         item: Dict[str, Any],
+        response: Dict[str, Any],
     ) -> None:
-        response = await runtime.helper.consume_response(request_id)
         if response:
             delivered = await self._emit_async_response(runtime, request_id, item, response)
             if delivered:
@@ -3080,7 +3686,7 @@ def load_config(path: Path) -> GatewayConfig:
         "query_concurrency": 1,
         "expected_helper_build_id": EXPECTED_LOCAL_HELPER_BUILD_ID,
         "expected_protocol_version": 2,
-        "expected_command_interval_ms": 50,
+        "expected_command_interval_ms": 25,
     }
     for key, expected in fixed_values.items():
         if raw.get(key) != expected:

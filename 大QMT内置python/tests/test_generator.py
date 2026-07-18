@@ -18,10 +18,10 @@ SPEC.loader.exec_module(generator)
 HELPER_SETTINGS = {
     "ENABLE_TRADING": False,
     "ENABLE_CANCEL_ORDER": False,
-    "MAX_COMMANDS_PER_TICK": 8,
+    "MAX_COMMANDS_PER_TICK": 4,
     "MAX_QUERIES_PER_TICK": 1,
-    "COMMAND_BUDGET_MS": 35.0,
-    "COMMAND_INTERVAL_MS": 50,
+    "COMMAND_BUDGET_MS": 15.0,
+    "COMMAND_INTERVAL_MS": 25,
     "QUERY_INTERVAL_MS": 500,
     "RECONCILE_INTERVAL_SECONDS": 30,
     "MAINTENANCE_INTERVAL_SECONDS": 60,
@@ -66,7 +66,7 @@ class GeneratorTest(unittest.TestCase):
         )
         accounts = deployment["qmt_config"]["accounts"]
         self.assertEqual(len(accounts), 1)
-        self.assertEqual(deployment["qmt_config"]["helper_settings"]["COMMAND_INTERVAL_MS"], 50)
+        self.assertEqual(deployment["qmt_config"]["helper_settings"]["COMMAND_INTERVAL_MS"], 25)
         self.assertFalse(deployment["qmt_config"]["helper_settings"]["ENABLE_TRADING"])
 
     def test_02_generated_files_are_ascii_python36_and_pinned(self):
@@ -88,9 +88,10 @@ class GeneratorTest(unittest.TestCase):
             )[0]
             self.assertNotIn("os.environ.get", helper_source)
             self.assertNotIn("os.getenv(", helper_source)
-            self.assertIn("COMMAND_INTERVAL_MS = 50", config_block)
+            self.assertIn("MAX_COMMANDS_PER_TICK = 4", config_block)
+            self.assertIn("COMMAND_INTERVAL_MS = 25", config_block)
             self.assertIn("QUERY_INTERVAL_MS = 500", config_block)
-            self.assertIn("COMMAND_BUDGET_MS = 35.0", config_block)
+            self.assertIn("COMMAND_BUDGET_MS = 15.0", config_block)
             self.assertIn("ENABLE_TRADING = False", config_block)
 
     def test_03_loader_exports_callbacks_and_rejects_tampering(self):
@@ -166,7 +167,7 @@ class GeneratorTest(unittest.TestCase):
             document = json.loads(path.read_text(encoding="ascii"))
             document["helper_settings"]["COMMAND_INTERVAL_MS"] = 100
             path.write_text(json.dumps(document, ensure_ascii=True), encoding="ascii")
-            with self.assertRaisesRegex(generator.ConfigError, "must remain 50"):
+            with self.assertRaisesRegex(generator.ConfigError, "must remain 25"):
                 generator.load_config(path)
             with self.assertRaisesRegex(generator.ConfigError, "must not overlap"):
                 generator.generate_from_env(

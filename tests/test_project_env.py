@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import shutil
@@ -152,13 +153,68 @@ class ProjectEnvTest(unittest.TestCase):
         self.assertEqual(gateway["event_watch_interval_seconds"], 0.01)
         self.assertEqual(api["recv_timeout"], 0.2)
         self.assertEqual(api["dispatch_queue_size"], 1024)
-        self.assertEqual(helper["COMMAND_INTERVAL_MS"], 50)
-        self.assertEqual(helper["COMMAND_BUDGET_MS"], 35.0)
+        self.assertEqual(helper["MAX_COMMANDS_PER_TICK"], 4)
+        self.assertEqual(helper["COMMAND_INTERVAL_MS"], 25)
+        self.assertEqual(helper["COMMAND_BUDGET_MS"], 15.0)
         keys = project_env.parse_env_file(self.example)
         self.assertFalse(any("TIMEOUT" in key or "QUEUE_SIZE" in key for key in keys))
         self.assertEqual(deployment["api_config"]["auth_token"], EXAMPLE_AUTH_TOKEN)
         self.assertNotIn(EXAMPLE_AUTH_TOKEN, json.dumps(gateway))
         self.assertRegex(gateway["auth_token_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_build_ids_and_helper_baseline_are_cross_component_locked(self):
+        def assignment(path, name):
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+            for node in tree.body:
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == name
+                ):
+                    return ast.literal_eval(node.value)
+            self.fail("missing assignment %s in %s" % (name, path))
+
+        helper_root = ROOT / "大QMT内置python"
+        helper_source = helper_root / "src" / "bigqmt_file_queue_helper.py"
+        loader_source = helper_root / "src" / "bigqmt_loader.py"
+        generator_source = helper_root / "tools" / "generate_helpers.py"
+        gateway_source = ROOT / "网关" / "bigqmt_gateway_proxy.py"
+        api_config_source = ROOT / "外置策略API" / "qmt_local_api" / "config.py"
+        baseline = json.loads(
+            (helper_root / "SOURCE_BASELINE.json").read_text(encoding="utf-8")
+        )
+        helper_id = project_env.HELPER_BUILD_ID
+        self.assertEqual(assignment(helper_source, "BUILD_ID"), helper_id)
+        self.assertEqual(assignment(loader_source, "EXPECTED_BUILD_ID"), helper_id)
+        self.assertEqual(assignment(generator_source, "EXPECTED_BUILD_ID"), helper_id)
+        self.assertEqual(assignment(gateway_source, "EXPECTED_LOCAL_HELPER_BUILD_ID"), helper_id)
+        self.assertEqual(baseline["build_id"], helper_id)
+        self.assertEqual(
+            assignment(gateway_source, "PROXY_BUILD_ID"),
+            project_env.GATEWAY_BUILD_ID,
+        )
+        self.assertEqual(
+            assignment(api_config_source, "EXPECTED_GATEWAY_BUILD_ID"),
+            project_env.GATEWAY_BUILD_ID,
+        )
+        self.assertEqual(
+            {
+                "MAX_COMMANDS_PER_TICK": assignment(
+                    helper_source, "MAX_COMMANDS_PER_TICK"
+                ),
+                "COMMAND_BUDGET_MS": assignment(helper_source, "COMMAND_BUDGET_MS"),
+                "COMMAND_INTERVAL_MS": assignment(helper_source, "COMMAND_INTERVAL_MS"),
+            },
+            {
+                key: project_env.FIXED_HELPER_SETTINGS[key]
+                for key in (
+                    "MAX_COMMANDS_PER_TICK",
+                    "COMMAND_BUDGET_MS",
+                    "COMMAND_INTERVAL_MS",
+                )
+            },
+        )
 
     def test_materialization_is_deterministic_and_summary_redacts_account_id(self):
         summary = project_env.materialize(

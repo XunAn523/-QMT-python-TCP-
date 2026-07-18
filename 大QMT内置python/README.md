@@ -15,7 +15,7 @@
 └─ run_tests.ps1
 ```
 
-helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260716_low_latency_v4_identity_guard`，与网关的 `expected_helper_build_id` 一致。
+helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard`，与网关的 `expected_helper_build_id` 一致。
 
 ## 唯一配置入口
 
@@ -36,8 +36,8 @@ helper build ID 固定为 `xuanling_bigqmt_file_queue_helper_20260716_low_latenc
 
 新项目不将性能/协议参数暴露到 `.env`。生成器会精确拒绝任何弱化，固定基线包括：
 
-- command 50ms、query 500ms、command budget 35ms、readiness 100ms；
-- 每 tick 最多 8 个 command、1 个 query，交易时查询让路；
+- command 25ms、query 500ms、command budget 15ms、readiness 100ms；
+- 每 tick 最多 4 个 command、1 个 query，交易时查询、reconcile 和 maintenance 均为交易命令让路；
 - heartbeat 1s、reconcile 30s、maintenance 60s；
 - request guard TTL 604800s、文件寿命 86400s、每轮清理 100 个、低优先级安静期 1s；
 - run-time timer 开启、quick trade 2、默认委托类型 1101、QMT user order ID 最长 23。
@@ -87,7 +87,7 @@ loader 在执行 helper 前校验 SHA-256，执行后再核对 helper name、acc
 .\run_tests.ps1 -PythonExe python
 ```
 
-验证包含 20 项回归：源模板 SHA-256、ASCII/Python 3.6 生成合同、单账户与占位阻断、固定性能参数、loader 防篡改、身份保护、幂等 guard、回调与撤单兼容性。测试使用根 `.env.example` 且显式开启 `--allow-example --ignore-process-env`，不会产生可部署配置。
+验证覆盖源模板 SHA-256、ASCII/Python 3.6 生成合同、单账户与占位阻断、固定性能参数、loader 防篡改、身份保护、幂等 guard、维护让路、回调与撤单兼容性。测试使用根 `.env.example` 且显式开启 `--allow-example --ignore-process-env`，不会产生可部署配置。
 
 ## 安全边界
 

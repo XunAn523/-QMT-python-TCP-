@@ -9,7 +9,7 @@ import os
 HELPER_PATH = r"C:\Quant\TradeBridge\helpers\account_demo\bigqmt_file_queue_helper.py"
 EXPECTED_HELPER_NAME = "account_demo"
 EXPECTED_ACCOUNT_ID = "00000000"
-EXPECTED_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260716_low_latency_v4_identity_guard"
+EXPECTED_BUILD_ID = "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard"
 EXPECTED_SHA256 = "REPLACED_BY_GENERATOR"
 # BIGQMT_LOADER_CONFIG_END
 

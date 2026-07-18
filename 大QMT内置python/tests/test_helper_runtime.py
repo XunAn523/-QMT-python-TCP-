@@ -78,6 +78,7 @@ class HelperRuntimeTest(unittest.TestCase):
             "requests_total": 0, "requests_ok": 0, "requests_failed": 0,
             "snapshots_total": 0, "command_cycles_total": 0,
             "query_cycles_total": 0, "command_timer_overrun_total": 0,
+            "maintenance_deferred_for_command_total": 0,
             "callback_events_total": 0, "last_request_elapsed_ms": 0.0,
             "last_snapshot_elapsed_ms": 0.0,
         }
@@ -130,6 +131,15 @@ class HelperRuntimeTest(unittest.TestCase):
         for name in ("ENABLE_TRADING", "ENABLE_CANCEL_ORDER"):
             self.assertIsInstance(assignments[name], ast.Constant)
             self.assertIs(assignments[name].value, False)
+        expected_low_latency = {
+            "MAX_COMMANDS_PER_TICK": 4,
+            "COMMAND_BUDGET_MS": 15.0,
+            "COMMAND_INTERVAL_MS": 25,
+            "BUILD_ID": "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard",
+        }
+        for name, expected in expected_low_latency.items():
+            self.assertIsInstance(assignments[name], ast.Constant)
+            self.assertEqual(assignments[name].value, expected)
 
     def test_02_complete_function_surface(self):
         names = (
@@ -149,7 +159,7 @@ class HelperRuntimeTest(unittest.TestCase):
         helper.G_RUN_TIME_READY = False
         helper.init(context)
         self.assertEqual([(a, b) for a, b, _ in context.run_time_calls], [
-            ("bigqmt_command_timer", "50nMilliSecond"),
+            ("bigqmt_command_timer", "25nMilliSecond"),
             ("bigqmt_query_timer", "500nMilliSecond"),
             ("bigqmt_heartbeat_timer", "1nSecond"),
             ("bigqmt_reconcile_timer", "30nSecond"),
@@ -160,7 +170,7 @@ class HelperRuntimeTest(unittest.TestCase):
             "name": helper.HELPER_NAME, "account_id": helper.ACCOUNT_ID,
             "account_type": helper.ACCOUNT_TYPE, "runtime_dir": helper.RUNTIME_DIR,
             "build_id": helper.BUILD_ID, "protocol_version": 2,
-            "command_interval_ms": 50,
+            "command_interval_ms": 25,
         }
         for path in (helper.STATE_FILE, helper.HEARTBEAT_FILE, helper.READINESS_FILE):
             document = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -181,6 +191,46 @@ class HelperRuntimeTest(unittest.TestCase):
         self.write_request(helper.INBOX_QUERIES_DIR, "query", "health")
         helper.bigqmt_query_timer(DummyContext())
         self.assertTrue(Path(helper.INBOX_QUERIES_DIR, "query.json").exists())
+
+    def test_05_maintenance_yields_to_pending_and_recent_commands(self):
+        original_cleanup = helper._cleanup_old_files
+        original_runtime_write = helper._safe_runtime_write
+        cleanup_calls = []
+        runtime_write_calls = []
+
+        def record_cleanup(*args, **kwargs):
+            cleanup_calls.append((args, kwargs))
+            return 0
+
+        helper._cleanup_old_files = record_cleanup
+        helper._safe_runtime_write = lambda *args: runtime_write_calls.append(args)
+        try:
+            self.write_request(helper.INBOX_COMMANDS_DIR, "maintenance-inbox", "health")
+            self.assertEqual(helper._run_maintenance_cycle(DummyContext(), "test"), 0)
+            self.assertEqual(cleanup_calls, [])
+            self.assertEqual(runtime_write_calls, [])
+            Path(helper.INBOX_COMMANDS_DIR, "maintenance-inbox.json").unlink()
+
+            self.write_request(helper.PROCESSING_COMMANDS_DIR, "maintenance-processing", "health")
+            self.assertEqual(helper._run_maintenance_cycle(DummyContext(), "test"), 0)
+            self.assertEqual(cleanup_calls, [])
+            self.assertEqual(runtime_write_calls, [])
+            Path(helper.PROCESSING_COMMANDS_DIR, "maintenance-processing.json").unlink()
+
+            helper.G_LAST_COMMAND_ACTIVITY_AT = time.time()
+            self.assertEqual(helper._run_maintenance_cycle(DummyContext(), "test"), 0)
+            self.assertEqual(cleanup_calls, [])
+            self.assertEqual(runtime_write_calls, [])
+            self.assertEqual(helper.G_METRICS["maintenance_deferred_for_command_total"], 3)
+
+            helper.G_LAST_COMMAND_ACTIVITY_AT = time.time() - helper.LOW_PRIORITY_QUIET_SECONDS - 1
+            self.assertEqual(helper._run_maintenance_cycle(DummyContext(), "test"), 1)
+            self.assertGreater(len(cleanup_calls), 0)
+            self.assertEqual(len(runtime_write_calls), 4)
+            self.assertEqual(helper.G_METRICS["maintenance_deferred_for_command_total"], 3)
+        finally:
+            helper._cleanup_old_files = original_cleanup
+            helper._safe_runtime_write = original_runtime_write
 
     def test_06_processing_guard_never_replays_passorder(self):
         calls = []

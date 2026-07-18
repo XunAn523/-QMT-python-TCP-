@@ -11,7 +11,7 @@ from .protocol import MAX_FRAME_BYTES, PROTOCOL_VERSION
 
 
 EXPECTED_GATEWAY_BUILD_ID = (
-    "xuanling_local_qmt_gateway_20260717_low_latency_v2_auth_guard"
+    "xuanling_local_qmt_gateway_20260718_low_latency_v3_bounded_io"
 )
 AUTH_TOKEN_PATTERN = re.compile(r"^[0-9A-Fa-f]{64}$")
 

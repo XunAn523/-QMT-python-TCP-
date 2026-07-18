@@ -11,6 +11,7 @@ helper-build/
 runtime/
 logs/
 *.log
+*.jsonl
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

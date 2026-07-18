@@ -1,13 +1,13 @@
 {
-  "build_id": "xuanling_bigqmt_file_queue_helper_20260716_low_latency_v4_identity_guard",
-  "hardened_helper_sha256": "BD5CBD42F861D886A2E9BEC669166E086BC4028F01282D333FDC7714845BBC6E",
+  "build_id": "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v5_25ms_guard",
+  "hardened_helper_sha256": "1B68A1EDC95EB7BD4A12BF269C39384890FA50D925130890A030B2D71857CA43",
   "protocol_version": 2,
   "source_commit": "0fd4e0ce2654828d0fd00d42958d701da5a88c5a",
   "source_file": "xuanlingtradebriage/bigqmt_file_queue_helper.py",
   "upstream_build_id": "xuanling_bigqmt_file_queue_helper_20260713_low_latency_v4",
   "upstream_helper_sha256": "9B7E272D0C5FF1DB881DB22C64F4624B2E398AB9189E04D2CE0258E921BB89AB",
   "timers": {
-    "command_interval_ms": 50,
+    "command_interval_ms": 25,
     "query_interval_ms": 500,
     "readiness_interval_ms": 100,
     "heartbeat_interval_seconds": 1,

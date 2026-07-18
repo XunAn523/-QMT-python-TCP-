@@ -21,11 +21,12 @@ python .\网关\bigqmt_gateway_proxy.py --config C:\Quant\QmtLocalBridge\generat
 - TCP v2、4 字节大端帧长、10 MiB 上限和 `TCP_NODELAY`；
 - 首帧 PING 必须通过 `.env` 64 位随机令牌、protocol、账户 ID/name 校验，认证前不注册 primary；
 - PONG 再由客户端校验 Gateway build、账户 ID 和账户名，令牌不回显且不进入心跳；
-- Helper 的账户 ID/type/name/runtime/build/protocol/50ms 周期校验；
-- 请求原子入队、命令/查询分流、响应与事件 10ms watcher；
+- Helper 的账户 ID/type/name/runtime/build/protocol/25ms 周期校验；
+- 请求原子入队、命令/查询分流、响应与事件 10ms watcher；响应 watcher 每轮只做一次有界目录扫描；
 - SQLite WAL/NORMAL 订单关联、`client_order_id` 幂等和单 writer lease；
 - 可靠事件在收到 `DELIVERY_ACK` 前保留，失败或断线后重投；
-- 查询 singleflight、缓存降级标记和未知提交状态保护。
+- 查询 singleflight、缓存降级标记和未知提交状态保护；
+- 固定的连接 dispatch、交易准备、pending response 和可靠投递背压，过载只在产生副作用前返回 `GATEWAY_BUSY`。
 
 `order_correlation.py` 是网关内部实现，不是外置策略 API。外置代码只导入 `qmt_local_api`。
 

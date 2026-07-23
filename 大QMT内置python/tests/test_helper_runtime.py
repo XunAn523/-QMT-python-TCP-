@@ -411,7 +411,15 @@ class HelperRuntimeTest(unittest.TestCase):
         self.assertEqual(len(passorder_calls), 1)
         self.assertEqual(self.response(command_request_id)["data"]["order_id"], "ORDER-RECOVERED")
         helper.G_LAST_COMMAND_ACTIVITY_AT = 0.0
-        helper.bigqmt_query_timer(DummyContext())
+        # This recovery test verifies queue movement, not the production
+        # trading-session query gate.  Keep it deterministic when the suite is
+        # executed during the local continuous-trading clock window.
+        original_trading_window = helper._is_continuous_trading_window
+        helper._is_continuous_trading_window = lambda: False
+        try:
+            helper.bigqmt_query_timer(DummyContext())
+        finally:
+            helper._is_continuous_trading_window = original_trading_window
         self.assertTrue(self.response(query_request_id)["ok"])
 
     def test_06_processing_recovery_crash_after_guard_is_submit_unknown(self):

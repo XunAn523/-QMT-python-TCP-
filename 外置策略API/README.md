@@ -77,6 +77,52 @@ build_order_request(
 
 `client_order_id` 是下单业务幂等键；`request_id` 是 NEW/CANCEL 交易副作用的网关幂等键。同一交易意图跨连接重试时可使用新的 `msg_id`，但必须复用原 `request_id`；省略或只传空白时保持原行为。`qmt_user_order_id` 最长 23 字符。建议省略 `intent_hash`，由 Gateway 按规范字段计算。
 
+## 多策略共用一个账户
+
+多个策略进程不能各自直接连接 `LocalQmtApi`。Gateway 只允许一个可靠事件 primary；新连接会替换旧连接，导致订单/成交回调归属不稳定。
+
+使用 `AccountCoordinator` 作为每账户唯一的外置接入者。它只保留一个 `LocalQmtApi` 连接，并将策略命令、账户级风险预占、可靠 Gateway 事件与每个策略的 durable outbox 写入自身 SQLite WAL。Gateway 的带 `delivery_id` 回调只有在 Coordinator 已完成 inbox、订单投影和 outbox 的同一事务后才 ACK。
+
+```python
+from pathlib import Path
+
+from qmt_local_api import (
+    AccountCoordinator,
+    CoordinatorLocalServer,
+    LocalQmtApi,
+    RiskLimits,
+)
+
+api = LocalQmtApi.from_env(r"D:\bridge\.env")
+coordinator = AccountCoordinator(
+    api,
+    Path(r"D:\bridge\coordinator_state.sqlite3"),
+    account_limits=RiskLimits(max_pending_notional=1_000_000),
+)
+coordinator.register_strategy(
+    "alpha",
+    "<alpha 的独立本机凭据>",
+    limits=RiskLimits(max_order_notional=100_000),
+)
+coordinator.register_strategy(
+    "beta",
+    "<beta 的独立本机凭据>",
+    limits=RiskLimits(max_order_notional=50_000),
+)
+
+if not coordinator.start():
+    raise RuntimeError("Gateway、Helper 或账户状态未就绪")
+
+server = CoordinatorLocalServer(coordinator, host="127.0.0.1", port=9560)
+server.start()
+```
+
+策略通过独立凭据连接 `CoordinatorLocalServer`：首帧为 `COORDINATOR_HELLO`，之后可发送 `ORDER_INTENT`、`CANCEL_INTENT`、`POLL_EVENTS`、`ACK_EVENT` 与 `ACCOUNT_STATUS`。`POLL_EVENTS` 为至少一次的持久化拉取；策略必须按 `coordinator_event_id` 先落库去重，再调用 `ACK_EVENT`。策略不得拥有根 `.env`、Gateway token 或 Helper runtime 的读写权限。
+
+`strategy_order_id` 是策略侧稳定幂等键。Coordinator 为实际 Gateway 下单统一生成账户范围唯一的 `client_order_id` 与 `request_id`，并拒绝跨策略的额度冲突。发生 `SUBMIT_UNKNOWN`、`EFFECT_STATE_UNKNOWN` 或 `RECONCILE_REQUIRED` 时，它会冻结账户新交易并要求对账，绝不换新 ID 自动重发。
+
+停止顺序为：先停止策略的命令入口，再停止 `CoordinatorLocalServer`，随后停止 `AccountCoordinator`，最后才停止 Gateway。Coordinator 数据库属于交易安全状态，不能与其 WAL/SHM 文件拆开删除或恢复。
+
 ## 示例
 
 - `示例/protocol_demo.py`：完全离线的拆包/粘包帧演示；

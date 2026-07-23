@@ -2,6 +2,15 @@
 
 from .api import LocalQmtApi, REDACTED, redact_for_output
 from .client import BridgeClient
+from .coordinator import (
+    AccountCoordinator,
+    CoordinatorConflict,
+    CoordinatorError,
+    CoordinatorRiskRejected,
+    CoordinatorUnavailable,
+    RiskLimits,
+)
+from .coordinator_server import CoordinatorLocalServer
 from .config import ConnectionConfig, EXPECTED_GATEWAY_BUILD_ID
 from .protocol import (
     FrameDecoder,
@@ -17,8 +26,14 @@ from .transport import TradeTransport, TransportDisconnected
 __version__ = "1.0.0"
 
 __all__ = [
+    "AccountCoordinator",
     "BridgeClient",
     "ConnectionConfig",
+    "CoordinatorConflict",
+    "CoordinatorError",
+    "CoordinatorRiskRejected",
+    "CoordinatorUnavailable",
+    "CoordinatorLocalServer",
     "DEFAULT_ENV_FILE",
     "EXPECTED_GATEWAY_BUILD_ID",
     "FrameDecoder",
@@ -28,6 +43,7 @@ __all__ = [
     "PROTOCOL_VERSION",
     "ProtocolError",
     "REDACTED",
+    "RiskLimits",
     "TradeTransport",
     "TransportDisconnected",
     "encode_frame",

@@ -18,4 +18,5 @@ logs/
 gateway_config.json
 qmt_config.json
 manifest.json
+/coordinator_config.json
 /docs/

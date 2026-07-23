@@ -1,6 +1,6 @@
 # Windows 外置侧单文件一键启动实施方案
 
-> 文档状态：待实施。
+> 文档状态：已实施，待目标机（大 QMT）验收。
 > 编写日期：2026-07-23。
 > 适用范围：一台 Windows、一个大 QMT 账户、现有 Gateway、可选多策略 Coordinator。
 > 目标：运维人员在外置 Windows 端只手动启动一个文件，即完成 Gateway、Coordinator 和已注册策略进程的受控启动、健康检查、监控与停止。
@@ -52,7 +52,7 @@
 | `start_external_windows.ps1` | 是，唯一人工入口 | 生命周期编排、预检、子进程启动、健康等待、PID 清单、停止与状态查询 |
 | `外置策略API/qmt_local_api/coordinator_host.py` | 否，只由启动器创建子进程 | 加载 Coordinator 配置，创建唯一 `LocalQmtApi`、`AccountCoordinator` 与 `CoordinatorLocalServer` |
 | `coordinator_config.example.json` | 否，模板 | 可提交的脱敏 Coordinator 配置样例 |
-| `coordinator_config.json` | 否，生产配置 | 策略身份、独立凭据哈希来源、额度、Coordinator 端口和可选策略进程；必须忽略并收紧 ACL |
+| `coordinator_config.json` | 否，生产配置 | 策略身份、独立凭据、额度、Coordinator 端口和可选策略进程；必须忽略并收紧 ACL |
 | `runtime/external_windows_state.json` | 否，运行产物 | PID、启动时间、配置摘要、健康状态；不可作为交易账本恢复来源 |
 
 根 `.env` 继续只保存账户、Gateway、Helper、路径和根 API 配置。`coordinator_config.json` 是外置策略层配置，不能替代或覆盖 `.env` 中任何 QMT 身份、端口、令牌或交易开关。
@@ -156,7 +156,9 @@ Host 是一个普通 CPython 长进程，其启动参数固定为：
 ```text
 --env-file <项目根/.env>
 --config <项目根/coordinator_config.json>
---state-file <runtime/external_windows_state.json>
+--status-file <runtime/coordinator_host_status.json>
+--control-pipe <随机本机命名管道名>
+--control-token-file <runtime/external_windows_control.token>
 ```
 
 它必须按以下顺序执行：
@@ -191,19 +193,19 @@ Host 启动失败、Gateway 身份失败、Helper 未 ready、查询降级、未
 .\start_external_windows.ps1 -Stop
 ```
 
-可选参数仅包括 `-EnvFile`、`-CoordinatorConfig`、`-NoWorkers`、`-Status`、`-Stop` 和开发期显式 `-PythonExe`。所有相对路径以项目根解析，启动器必须拒绝不在项目根内的 Coordinator 配置与 worker 程序路径。
+可选参数仅包括 `-EnvFile`、`-CoordinatorConfig`、`-NoWorkers`、`-Status`、`-Stop`、`-Force` 和 `-StartupTimeoutSeconds`。所有相对路径以项目根解析，启动器必须拒绝不在项目根内的 Coordinator 配置与 worker 程序路径。
 
 ### 7.2 启动步骤
 
 ```text
-0. 取得单实例启动锁，拒绝第二个启动器
+0. 取得当前用户范围的 Windows named mutex，拒绝第二个启动器
 1. 定位项目根，验证本机 Windows、根 .env 和 coordinator_config.json
 2. 若 .venv 缺失，调用 setup_venv.ps1；存在时只验证，不重建
 3. 用 project_env.py 解析 .env 并生成 Gateway/QMT 配置
 4. 调用 preflight.py --deployment，验证端口、路径、SQLite 与 Helper 三份 health
 5. 检查本启动器状态文件，不允许遗留 PID 未确认时直接双开
 6. 后台启动 Gateway 子进程，写入单独日志文件
-7. 等待 Gateway TCP PING/PONG 身份校验成功；不是仅检查端口已打开
+7. 等待 Gateway TCP 端口；随后由唯一 Coordinator 的 `LocalQmtApi` 完成 PING/PONG、构建号和账户 ready 校验，不能只因端口已打开就启动 worker
 8. 后台启动 coordinator_host.py，等待状态文件和 Coordinator PONG ready
 9. 仅当 Coordinator 可交易时，按确定顺序启动 enabled worker
 10. 原子写 external_windows_state.json，前台等待并监控全部子进程
@@ -215,7 +217,7 @@ Host 启动失败、Gateway 身份失败、Helper 未 ready、查询降级、未
 
 ### 7.3 单实例、PID 与健康状态
 
-启动器创建一个仅当前运行账户可访问的本机 mutex/lock 文件，并在 `runtime/external_windows_state.json` 原子记录：
+启动器创建一个当前用户范围的 Windows named mutex，并在 `runtime/external_windows_state.json` 原子记录：
 
 ```json
 {
@@ -232,7 +234,7 @@ Host 启动失败、Gateway 身份失败、Helper 未 ready、查询降级、未
 }
 ```
 
-不得写入账户 ID、Gateway token、策略 token、完整 `.env`、命令行明文凭据或 Coordinator 数据库内容。`-Status` 只读取该文件并执行 loopback 健康探测；PID 存在不等于健康，端口可用也不等于身份正确。
+不得写入账户 ID、Gateway token、策略 token、完整 `.env`、命令行明文凭据或 Coordinator 数据库内容。`-Status` 读取该文件，并通过已认证命名管道向 Coordinator 查询无凭据健康摘要；PID 存在不等于健康，端口可用也不等于身份正确。
 
 ### 7.4 异常与退出策略
 
@@ -291,7 +293,7 @@ COORDINATOR_HELLO
 
 ### 10.1 自动化测试
 
-新增测试至少覆盖：
+本次已新增严格配置和命名管道控制测试，并复用现有模拟 Gateway 的双策略订单/可靠事件链测试。目标机验收前仍应补充或人工执行：
 
 1. 缺失 `.venv` 时调用 `setup_venv.ps1`，存在时不重建；
 2. `.env`、Coordinator JSON、路径逃逸、非回环监听、示例 token 和重复策略 ID 全部失败关闭；

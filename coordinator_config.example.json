@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 9560,
+    "max_clients": 32
+  },
+  "state_db": "runtime\\coordinator_state.sqlite3",
+  "account_limits": {
+    "max_order_notional": 1000000.0,
+    "max_pending_notional": 1000000.0
+  },
+  "strategies": [
+    {
+      "strategy_id": "alpha",
+      "auth_token": "REPLACE_WITH_A_SEPARATE_RANDOM_LOCAL_SECRET",
+      "enabled": true,
+      "priority": 100,
+      "limits": {
+        "max_order_notional": 100000.0,
+        "max_pending_notional": 200000.0
+      },
+      "worker": {
+        "enabled": false,
+        "program": "策略\\alpha.py",
+        "arguments": [],
+        "working_directory": "."
+      }
+    }
+  ]
+}

@@ -5448,33 +5448,6 @@ class BigQmtGatewayProxy:
         if len(runtime.seen_event_ids) > 20000:
             runtime.seen_event_ids.clear()
 
-    async def _deliver_live_event(self, runtime: AccountRuntime, event: Dict[str, Any]) -> None:
-        try:
-            await self.emit_event(runtime, event)
-            await runtime.helper.ack_event(event)
-        except Exception as exc:
-            exhausted = await runtime.helper.retry_event(event)
-            self.logger.warning(
-                "live_event_delivery_failed account=%s event_id=%s error=%s",
-                runtime.cfg.account_id, event.get("event_id"), exc,
-            )
-            if exhausted:
-                runtime.qmt_status = {
-                    **runtime.qmt_status,
-                    "state": "delivery_degraded",
-                    "ready": False,
-                    "last_error": "live event delivery exhausted; reconcile required",
-                    "updated_at": now(),
-                }
-                await self.broadcast(runtime, {
-                    "protocol_version": 2,
-                    "type": "RECONCILE_REQUIRED",
-                    "account_id": runtime.cfg.account_id,
-                    "reason": "live_event_delivery_exhausted",
-                    "event_id": safe_str(event.get("event_id")),
-                    "timestamp": now(),
-                })
-
     async def _retry_live_event(
         self,
         runtime: AccountRuntime,

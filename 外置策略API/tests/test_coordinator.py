@@ -7,7 +7,6 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
-import time
 import unittest
 
 

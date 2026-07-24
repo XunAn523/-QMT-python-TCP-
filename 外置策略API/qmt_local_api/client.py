@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Optional, Union
 
 from .config import ConnectionConfig
 from .dispatcher import AsyncMessageDispatcher, DispatchResult
-from .protocol import MAX_FRAME_BYTES, PROTOCOL_VERSION
+from .protocol import PROTOCOL_VERSION
 from .query_broker import QueryBroker
 from .transport import TradeTransport, TransportDisconnected
 

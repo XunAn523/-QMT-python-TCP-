@@ -20,7 +20,6 @@ import math
 import ntpath
 import os
 import signal
-import socket
 import struct
 import sys
 import time

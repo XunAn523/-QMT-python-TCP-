@@ -16,7 +16,7 @@ from common import (
     register_journal_handlers,
 )
 
-from qmt_local_api import LocalQmtApi, LocalRuntimeConfig, encode_frame, redact_for_output
+from qmt_local_api import LocalRuntimeConfig, encode_frame, redact_for_output
 
 
 LIVE_CONFIRMATION = "I_UNDERSTAND_THIS_SENDS_A_LIVE_ORDER"

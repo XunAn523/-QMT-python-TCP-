@@ -22,7 +22,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 
 _STRATEGY_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")

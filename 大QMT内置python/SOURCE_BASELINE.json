@@ -1,6 +1,6 @@
 {
   "build_id": "xuanling_bigqmt_file_queue_helper_20260718_low_latency_v12_fail_closed_sibling_scan",
-  "hardened_helper_sha256": "BE259813F073C8A00A2311D9DEACF92AF3C218BDE55EB977FF81B794F511BE36",
+  "hardened_helper_sha256": "03D87086A3DC184427A81B1B5BFD5DE1952D2F6393C7AA26AC3ED9D5B6E6AC98",
   "protocol_version": 2,
   "source_commit": "0fd4e0ce2654828d0fd00d42958d701da5a88c5a",
   "source_file": "xuanlingtradebriage/bigqmt_file_queue_helper.py",

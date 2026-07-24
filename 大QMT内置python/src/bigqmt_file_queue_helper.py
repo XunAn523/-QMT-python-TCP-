@@ -395,11 +395,6 @@ def _duplicate_state(request):
     return None, guard
 
 
-def _duplicate_response(request):
-    response, _ = _duplicate_state(request)
-    return response
-
-
 def _qmt_func(name):
     return globals().get(name)
 

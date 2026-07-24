@@ -316,16 +316,6 @@ def normalize_standard_order_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def normalize_standard_orders(items: Any, runtime: Any = None) -> List[Dict[str, Any]]:
-    result = []
-    for item in (items or []):
-        if not isinstance(item, dict):
-            continue
-        payload = runtime.apply_order_side_intent(item) if runtime else item
-        result.append(normalize_standard_order_payload(payload))
-    return result
-
-
 async def normalize_standard_orders_async(
     items: Any, runtime: Any = None,
 ) -> List[Dict[str, Any]]:
@@ -414,18 +404,6 @@ def apply_order_side_lookup(item: Dict[str, Any], lookup: Dict[str, Dict[str, An
         payload["order_type_source"] = "matched_order"
         payload["order_type_valid"] = True
     return payload
-
-
-def normalize_standard_trades(items: Any, orders: Any = None, runtime: Any = None) -> List[Dict[str, Any]]:
-    lookup = build_order_side_lookup(orders)
-    result = []
-    for item in (items or []):
-        if not isinstance(item, dict):
-            continue
-        payload = runtime.apply_order_side_intent(item) if runtime else item
-        payload = apply_order_side_lookup(payload, lookup)
-        result.append(normalize_standard_order_payload(payload))
-    return result
 
 
 async def normalize_standard_trades_async(
@@ -586,22 +564,6 @@ def read_json_file(path: Path, default: Optional[Dict[str, Any]] = None) -> Dict
         return data if isinstance(data, dict) else (default or {})
     except FileNotFoundError:
         return default or {}
-
-
-def probe_tcp_port(host: str, port: int, timeout: float = 0.2) -> tuple[bool, str, float]:
-    started = time.perf_counter()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(max(0.05, timeout))
-    try:
-        sock.connect((host, port))
-        return True, "", (time.perf_counter() - started) * 1000
-    except OSError as exc:
-        return False, safe_str(exc), (time.perf_counter() - started) * 1000
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
 
 
 async def run_blocking(func, *args):
